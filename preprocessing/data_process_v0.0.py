@@ -221,7 +221,8 @@ def filter_cell_indices_qc_backed(
 
     # 2) Mitochondrial gene indices (no X reading)
     var_names = adata_b.var_names.astype(str)
-    mt_mask = var_names.str.startswith(mt_prefix) | var_names.str.startswith(mt_prefix.lower())
+    # mt_mask = var_names.str.startswith(mt_prefix) | var_names.str.startswith(mt_prefix.lower())
+    mt_mask = adata_b.var["mt"].values.astype(bool)
     mt_idx = np.where(mt_mask.values)[0].astype(np.int64)
     has_mt = mt_idx.size > 0
     if not has_mt:
@@ -446,8 +447,8 @@ def encode_labels(series: pd.Series) -> Tuple[np.ndarray, Dict[str, int]]:
 
 def csr_row_to_topk_tokens(row: sp.csr_matrix,
                            gene_ids_array: np.ndarray,
-                           edges: np.ndarray,
-                           topk: int) -> Tuple[np.ndarray, np.ndarray, int]:
+                           topk: int,
+                           n_bins: int) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Core Tokenization Function: Convert single cell expression vector to token sequence.
 
@@ -486,12 +487,22 @@ def csr_row_to_topk_tokens(row: sp.csr_matrix,
         idx = idx[sel]
         val = val[sel]
 
-    # Per-gene binning: Each gene uses its own quantile edges
-    bins = np.empty(val.shape[0], dtype=np.int16)
-    for t, j in enumerate(idx):
-        # searchsorted: Find position where val[t] should be inserted in edges[j]
-        # side="right": Values equal to edge fall into the next bin
-        bins[t] = np.searchsorted(edges[j], val[t], side="right")
+    # # Per-gene binning: Each gene uses its own quantile edges
+    # bins = np.empty(val.shape[0], dtype=np.int16)
+    # for t, j in enumerate(idx):
+    #     # searchsorted: Find position where val[t] should be inserted in edges[j]
+    #     # side="right": Values equal to edge fall into the next bin
+    #     bins[t] = np.searchsorted(edges[j], val[t], side="right")
+
+    L = val.size
+    if L == 0:
+        return np.empty((0,), np.int32), np.empty((0,), np.int16), 0
+    
+    order = np.argsort(-val)               
+    ranks = np.empty(L, dtype=np.int32)
+    ranks[order] = np.arange(L) 
+
+    bins = (n_bins - (ranks * n_bins) // L).astype(np.int16)
 
     # Gene Index -> Vocab ID
     g = gene_ids_array[idx].astype(np.int32)
@@ -569,79 +580,12 @@ def step_hvg(h5ad_path: Path,
     adata_b.file.close()
     return hvg_genes
 
-def step_bins_edges(h5ad_path: Path,
-                    out_dir: Path,
-                    hvg_genes: List[str],
-                    edge_sample_total: int,
-                    n_bins: int,
-                    seed: int, min_genes: int, max_genes: int,
-                    min_counts: int, max_counts: int,
-                    max_pct_mt: float, mt_prefix: str,
-                    qc_chunk_size: int) -> np.ndarray:
-    """
-    Step 3: Compute Per-gene quantile bin edges
-
-    Binning principle (e.g., n_bins=32):
-        - Compute 31 internal quantiles: 3.2%, 6.4%, ..., 96.8%.
-        - Assign to bin based on which quantiles the expression value falls between.
-        - bin_id range: 0 to n_bins-1.
-
-    Output: gene_bin_edges.npy [G, n_bins-1]
-    """
-    print("[BINS] Opening backed AnnData for edge estimation ...")
-    adata_b = sc.read_h5ad(str(h5ad_path), backed="r")
-    obs = adata_b.obs.copy()
-    keep_idx = filter_cell_indices_qc_backed(
-        adata_b,
-        filter_doublets=True,
-        doublet_col="predicted_doublet",
-        min_genes=min_genes,
-        max_genes=max_genes,
-        min_counts=min_counts,
-        max_counts=max_counts,
-        max_pct_mt=max_pct_mt,
-        mt_prefix=mt_prefix,
-        chunk_size=qc_chunk_size,
-    )
-
-    sample_total = min(edge_sample_total, keep_idx.size)
-    rng = set_seed(seed + 17)
-    sample_idx = rng.choice(keep_idx, size=sample_total, replace=False)
-
-    print(f"[BINS] Loading {sample_total} cells × {len(hvg_genes)} HVG genes into memory ...")
-    adata_sub = adata_b[sample_idx, hvg_genes].to_memory()
-    if sp.issparse(adata_sub.X):
-        adata_sub.X = adata_sub.X.tocsr()
-    normalize_log1p_inplace(adata_sub)
-
-    X = adata_sub.X.tocsr() if sp.issparse(adata_sub.X) else np.asarray(adata_sub.X)
-
-    qs = np.linspace(0, 1, n_bins + 1)[1:-1]  # internal quantiles
-    G = adata_sub.n_vars
-    edges = np.zeros((G, len(qs)), dtype=np.float32)
-
-    print(f"[BINS] Computing per-gene quantile edges: G={G}, bins={n_bins} ...")
-    for j in tqdm(range(G), desc="[BINS] quantiles", unit="gene"):
-        col = X[:, j]
-        if sp.issparse(col):
-            col = col.toarray().reshape(-1)
-        else:
-            col = np.asarray(col).reshape(-1)
-        edges[j] = np.quantile(col, qs)
-
-    out_file = out_dir / "gene_bin_edges.npy"
-    np.save(out_file, edges)
-    print(f"[BINS] Saved edges {edges.shape} -> {out_file}")
-
-    adata_b.file.close()
-    return edges
-
 def step_tokenize_shards(h5ad_path: Path,
                          out_dir: Path,
                          hvg_genes: List[str],
                          hvg_genes_for_vocab: List[str],
                          vocab: Dict[str, int],
-                         edges: np.ndarray,
+                         n_bins: int,
                          topk: int,
                          chunk_size: int,
                          target: Optional[str],
@@ -758,7 +702,7 @@ def step_tokenize_shards(h5ad_path: Path,
 
         for i in range(N):
             row = X_chunk.getrow(i)
-            g, b, L = csr_row_to_topk_tokens(row, gene_ids_array, edges, topk=topk)
+            g, b, L = csr_row_to_topk_tokens(row, gene_ids_array, topk=topk, n_bins=n_bins)
             lengths[i] = L
             if L > 0:
                 L2 = min(topk, L)
@@ -847,7 +791,7 @@ def parse_args() -> argparse.Namespace:
     # === Labels ===
     p.add_argument("--target", type=str, default=None,
                     help="Prediction target column (e.g., compartment, cellType1). If not set, labels are not saved.")
-    p.add_argument("--text_cols", type=str, default="tissue,region,sampleType,compartment,cellType1,cellType2,majorCluster,subCluster,sex,age,perturbType,disease,drug,dose",
+    p.add_argument("--text_cols", type=str, default="tissue,region,sampleType,compartment,cellType1,cellType2,majorCluster,subCluster,sex,age,perturbType,disease,drug,dose,time",
         help="Comma-separated obs column names to save as text_data, e.g.: tissue,region,cellType1,cellType2")
     p.add_argument("--save_domain_ids", action="store_true",
                    help="Save batch IDs for downstream use (default not saved for pretrain)")
@@ -867,7 +811,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min_counts", type=int, default=1000)
     p.add_argument("--max_counts", type=int, default=100000)
     p.add_argument("--max_pct_mt", type=float, default=20.0)
-    p.add_argument("--mt_prefix", type=str, default="MT-",
+    p.add_argument("--mt_prefix", type=str, default=None,
                    help="Mitochondrial gene prefix (commonly MT- for human; mt- for mouse)")
     p.add_argument("--qc_chunk_size", type=int, default=50000,
                    help="Chunk size when scanning X for QC (default: 50000)")
@@ -1003,21 +947,6 @@ def main():
     # Step 4: Compute Per-gene Bin Edges
     # Input: Original h5ad + hvg_genes_for_adata (original gene names) -> Output: gene_bin_edges.npy
     # =========================================================================
-    edges = step_bins_edges(
-        h5ad_path=h5ad_path,
-        out_dir=out_dir,
-        hvg_genes=hvg_genes_for_adata,  # Use original gene names to index adata
-        edge_sample_total=args.edge_sample_total,
-        n_bins=args.n_bins,
-        seed=args.seed,
-        min_genes=args.min_genes,
-        max_genes=args.max_genes,
-        min_counts=args.min_counts,
-        max_counts=args.max_counts,
-        max_pct_mt=args.max_pct_mt,
-        mt_prefix=args.mt_prefix,
-        qc_chunk_size=args.qc_chunk_size,
-    )
 
     # =========================================================================
     # Step 5: Tokenize All Cells and Shard Save
@@ -1030,7 +959,6 @@ def main():
         hvg_genes=hvg_genes_for_adata,           # Original gene names, used for indexing adata
         hvg_genes_for_vocab=hvg_genes_for_vocab, # HGNC symbols, used for looking up vocab ID
         vocab=vocab,
-        edges=edges,
         topk=args.topk,
         chunk_size=args.chunk_size,
         target=args.target,
@@ -1082,6 +1010,5 @@ python data_process_server.py \
   --chunk_size 50000 \
   --min_genes 500 --max_genes 8000 \
   --min_counts 1000 --max_counts 100000 \
-  --max_pct_mt 20 \
-  --mt_prefix MT-
+  --max_pct_mt 20 
 """
