@@ -1,0 +1,82 @@
+CROSSCELL:
+  description: >
+    Cell-centric cross-attention foundation architecture
+    for multimodal perturbation modeling.
+
+  input:
+    cell:
+      - binned_gene_expression
+      - optional_cell_metadata
+    perturbation:
+      - drug_structure
+      - dose
+      - time
+      - optional_other_modalities
+
+  stages:
+
+    - name: Cell Tokenization
+      module: CellTokenizer
+      input:
+        - binned_gene_expression
+      output:
+        tokens: [B, Lg, H]
+        mask: null
+
+    - name: Perturbation Tokenization
+      module: PerturbationTokenizer
+      input:
+        - drug_structure
+        - dose
+        - time
+      output:
+        tokens: [B, Lp, H]
+        mask: [B, 1, 1, Lp]
+
+    - name: Control Encoding
+      description: Intrinsic cell state modeling
+      module: SelfAttentionEncoder
+      input:
+        - cell_tokens
+      output:
+        ctl_cell_tokens: [B, L, H]
+
+    - name: Treatment Encoding
+      description: Perturbation-conditioned cell state modeling
+      module: CrossAttentionEncoder
+      structure:
+        - cross_attention_first
+        - self_attention_middle
+        - cross_attention_last
+      input:
+        - cell_tokens
+        - perturbation_tokens
+      output:
+        trt_cell_tokens: [B, L, H]
+
+    - name: Cell-level Pooling
+      module: CellLevelPooling
+      input:
+        - ctl_cell_tokens
+        - trt_cell_tokens
+      output:
+        ctl_cell_repr: [B, H]
+        trt_cell_repr: [B, H]
+
+    - name: Downstream Tasks
+      tasks:
+        - name: Expression Prediction
+          level: gene
+          input:
+            - ctl_cell_tokens
+            - trt_cell_tokens
+          output:
+            - exact_expression_values
+
+        - name: Cell Type Classification
+          level: cell
+          input:
+            - ctl_cell_repr
+            - trt_cell_repr
+          output:
+            - cell_type_logits
