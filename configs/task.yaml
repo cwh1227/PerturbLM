@@ -1,0 +1,9 @@
+tasks:
+  expression:
+    type: regression
+    level: gene
+    loss: mse
+  celltype:
+    type: classification
+    level: cell
+    loss: cross_entropy

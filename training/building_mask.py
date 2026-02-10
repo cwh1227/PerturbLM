@@ -26,6 +26,20 @@ def sample_mask_positions(
     return mask_positions
 
 
+def apply_mask_to_input(
+    input_ids: torch.Tensor,
+    mask_positions: torch.Tensor,
+    mask_token_id: int
+):
+    """
+    Replace selected positions with MASK token.
+    """
+    masked_input = input_ids.clone()
+    masked_input[mask_positions] = mask_token_id
+    return masked_input
+
+
+
 
 def build_attention_mask(input_ids, pad_token_id):
     """

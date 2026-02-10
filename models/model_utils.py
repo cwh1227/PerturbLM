@@ -288,8 +288,6 @@ class CrossAttention(nn.Module):
 
 
 
-
-
 class FeedForward(nn.Module):
     def __init__(self, hidden_size, intermediate_size, hidden_dropout_prob):
         super(FeedForward, self).__init__()
