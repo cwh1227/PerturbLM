@@ -172,13 +172,17 @@ def step_build_gene_mapping(
     bmg_sep: Optional[str],
     bmg_ensembl_col: str,
     bmg_id_col: str,
+    bmg_symbol_col: str,
     out_dir: Path,
 ) -> Tuple[np.ndarray, Dict[str, int]]:
     """
     Step 1: Build mapping from gctx gene index to BMG token ID.
 
-    Mapping chain:
+    Mapping chain (primary):
         gctx gene index → Entrez ID → (geneinfo) → Ensembl ID → (BMG table) → BMGid
+
+    Fallback (when Ensembl mapping fails):
+        Entrez ID → (geneinfo) → gene_symbol → (BMG table, bmg_symbol_col) → BMGid
 
     Vocabulary format (aligned with data_process_v0.0.py):
         {"<pad>": 0, "<cls>": 1, "BMGC_GN00001": 2, "BMGC_GN00002": 3, ...}
@@ -190,6 +194,7 @@ def step_build_gene_mapping(
         bmg_sep: CSV separator (None for auto-detect)
         bmg_ensembl_col: Column name for Ensembl ID in BMG table
         bmg_id_col: Column name for BMG identifier
+        bmg_symbol_col: Column name for gene symbol in BMG table (fallback mapping)
         out_dir: Output directory
 
     Returns:
@@ -228,12 +233,42 @@ def step_build_gene_mapping(
         ["ensembl_norm", "bmgid"]
     ].drop_duplicates("ensembl_norm", keep="first")
 
-    # ---- Join: Entrez → Ensembl → BMGid ----
-    gi2 = gi.loc[
-        gi["ensembl_norm"] != "",
-        ["entrez_id", "ensembl_norm", "gene_symbol"]
-    ].copy()
+    # ---- BMG: Symbol → BMGid (fallback lookup) ----
+    symbol_to_bmgid: Dict[str, str] = {}
+    if bmg_symbol_col and bmg_symbol_col in bmg.columns:
+        bmg["symbol_norm"] = bmg[bmg_symbol_col].apply(
+            lambda x: str(x).strip() if pd.notna(x) and str(x).strip().lower() not in ("nan", "none", "") else ""
+        )
+        bmg_sym2 = bmg.loc[
+            bmg["symbol_norm"] != "",
+            ["symbol_norm", "bmgid"]
+        ].drop_duplicates("symbol_norm", keep="first")
+        symbol_to_bmgid = dict(zip(bmg_sym2["symbol_norm"], bmg_sym2["bmgid"]))
+        print(f"[GENE MAP] BMG symbol lookup built ({bmg_symbol_col}): {len(symbol_to_bmgid):,} unique symbols")
+    else:
+        print(f"[GENE MAP] Warning: '{bmg_symbol_col}' not in BMG columns, skipping symbol fallback")
+
+    # ---- Join: Entrez → Ensembl → BMGid (primary) ----
+    # Keep ALL genes (including those without Ensembl ID) so symbol fallback can apply
+    gi2 = gi[["entrez_id", "ensembl_norm", "gene_symbol"]].copy()
     gi2 = gi2.merge(bmg2, on="ensembl_norm", how="left")
+    # Rows with ensembl_norm=="" or no BMG match → bmgid is NaN
+
+    # ---- Symbol fallback: gene_symbol → HGNC_Symbol → BMGid ----
+    if symbol_to_bmgid:
+        primary_failed = gi2["bmgid"].isna() | gi2["bmgid"].str.lower().isin(["nan", "none", ""])
+        if primary_failed.any():
+            gi2["_sym"] = gi2["gene_symbol"].apply(
+                lambda x: str(x).strip() if pd.notna(x) and str(x).strip().lower() not in ("nan", "none", "") else ""
+            )
+            can_fallback = primary_failed & (gi2["_sym"] != "")
+            gi2.loc[can_fallback, "bmgid"] = gi2.loc[can_fallback, "_sym"].map(symbol_to_bmgid)
+            gi2.drop(columns=["_sym"], inplace=True)
+
+            still_failed = gi2["bmgid"].isna() | gi2["bmgid"].str.lower().isin(["nan", "none", ""])
+            n_ensembl = (~primary_failed).sum()
+            n_symbol  = (primary_failed & ~still_failed).sum()
+            print(f"[GENE MAP] Mapped via Ensembl: {n_ensembl:,}, via symbol fallback: {n_symbol:,}, still unmapped: {still_failed.sum():,}")
 
     entrez_to_bmgid = dict(zip(gi2["entrez_id"], gi2["bmgid"]))
     entrez_to_symbol = dict(zip(gi2["entrez_id"], gi2["gene_symbol"]))
@@ -662,6 +697,8 @@ def parse_args() -> argparse.Namespace:
                    help="Ensembl column name in BMG table (default: Ensembl_Gene_ID)")
     p.add_argument("--bmg_id_col", type=str, default="BioMedGraphica_Conn_ID",
                    help="BMG identifier column name (default: BioMedGraphica_Conn_ID)")
+    p.add_argument("--bmg_symbol_col", type=str, default="HGNC_Symbol",
+                   help="Symbol column in BMG table for fallback mapping when Ensembl fails (default: HGNC_Symbol)")
 
     # === Output ===
     p.add_argument("--out_dir", type=str, required=True,
@@ -751,6 +788,7 @@ def main():
         bmg_sep=args.bmg_sep,
         bmg_ensembl_col=args.bmg_ensembl_col,
         bmg_id_col=args.bmg_id_col,
+        bmg_symbol_col=args.bmg_symbol_col,
         out_dir=out_dir,
     )
 
