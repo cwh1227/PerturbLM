@@ -1,7 +1,7 @@
 """
 =============================================================================
 Server-friendly preprocessing for CLUE/L1000 level3 gctx
-Output format: BMG-token sequence + rank-based binned expression (+ metadata)
+Output format: HGNC-token sequence + rank-based binned expression (+ metadata)
 =============================================================================
 
 Requirements (HPC / server):
@@ -21,16 +21,17 @@ Step 0: Load metadata
 
 Step 1: Build gene mapping + vocabulary
   - gctx stores Entrez IDs as row identifiers
-  - Mapping chain: Entrez → (geneinfo) → Ensembl → (BMG table) → BioMedGraphica_Conn_ID
+  - Mapping chain (primary):  Entrez → (geneinfo) → Ensembl → (HGNC table) → HGNC numeric ID
+  - Mapping chain (fallback): Entrez → (geneinfo) → gene_symbol → (HGNC alias) → HGNC numeric ID
   - Build vocabulary (dict format, aligned with single-cell pipeline):
-      {"<pad>": 0, "<cls>": 1, "BMGC_GN00001": 2, ...}
+      {"<pad>": 0, "<cls>": 1, "5": 2, ...}  (keys are HGNC numeric ID strings)
   - Outputs:
-      * gene_vocab.json                     (BMGid → token_id)
-      * conn_id_to_hgnc.json                (BMGid → gene symbol, for interpretation)
-      * gene_map_gctxindex_to_bmgtoken.npy  (gctx gene index → token_id)
-      * gctx_gene_to_bmgid.tsv              (readable debug table)
-      * genes_entrez.json                   (Entrez IDs reference)
-      * genes_symbol.json                   (gene symbols reference)
+      * gene_vocab.json                      (HGNC numeric ID → token_id)
+      * conn_id_to_hgnc.json                 (HGNC numeric ID → gene symbol, for interpretation)
+      * gene_map_gctxindex_to_hgnctoken.npy  (gctx gene index → token_id)
+      * gctx_gene_to_hgncid.tsv             (readable debug table)
+      * genes_entrez.json                    (Entrez IDs reference)
+      * genes_symbol.json                    (gene symbols reference)
 
 Step 2: Tokenize + shard
   - Stream over gctx columns (signatures) in chunks
@@ -45,7 +46,7 @@ Step 2: Tokenize + shard
       * domain_map.json
 
 Each shard contains:
-  gene_ids  int32   [B, K]   - BMG token ids (0 = <pad>)
+  gene_ids  int32   [B, K]   - HGNC token ids (0 = <pad>)
   bin_ids   int16   [B, K]   - rank-based bins (0 = padding, 1~n_bins = real)
   lengths   int16   [B]      - non-PAD count per row
   text_data U       [B, C]   - standard metadata columns (unicode, aligned with single-cell)
@@ -61,9 +62,10 @@ Design notes
 =============================================================================
 
 Gene ID alignment:
-  - Vocabulary keys are BioMedGraphica_Conn_ID, identical to the single-cell
-    pipeline (data_process_v0.0.py). This allows multi-modal pretraining
-    where L1000 signatures and single-cell data share the same gene token space.
+  - Vocabulary keys are HGNC numeric IDs (e.g., "5" from "HGNC:5"), identical
+    to the single-cell pipeline (data_process_v0.0.py). This allows multi-modal
+    pretraining where L1000 signatures and single-cell data share the same gene
+    token space.
 
 Text data alignment:
   - Uses the same 15 standard columns as the single-cell pipeline.
@@ -90,8 +92,7 @@ python data_process_L1000_v0.1.py \
   --cellinfo cellinfo_beta.txt \
   --compoundinfo compoundinfo_beta.txt \
   --geneinfo geneinfo_beta.txt \
-  --bmg BioMedGraphica_Conn_Gene.csv \
-  --bmg_id_col BioMedGraphica_Conn_ID \
+  --hgnc hgnc_complete_set.txt \
   --out_dir out_L1000 \
   --use_abs
 =============================================================================
@@ -162,141 +163,142 @@ def encode_labels(series: pd.Series) -> Tuple[np.ndarray, Dict[str, int]]:
 
 
 # =============================================================================
-# Gene Mapping: gctx Entrez → Ensembl → BioMedGraphica_Conn_ID
+# Gene Mapping: gctx Entrez → Ensembl → HGNC numeric ID
 # =============================================================================
 
 def step_build_gene_mapping(
     gctx_entrez: List[str],
     geneinfo_path: Path,
-    bmg_path: Path,
-    bmg_sep: Optional[str],
-    bmg_ensembl_col: str,
-    bmg_id_col: str,
-    bmg_symbol_col: str,
+    hgnc_path: Path,
     out_dir: Path,
 ) -> Tuple[np.ndarray, Dict[str, int]]:
     """
-    Step 1: Build mapping from gctx gene index to BMG token ID.
+    Step 1: Build mapping from gctx gene index to HGNC token ID.
 
     Mapping chain (primary):
-        gctx gene index → Entrez ID → (geneinfo) → Ensembl ID → (BMG table) → BMGid
+        gctx gene index → Entrez ID → (geneinfo) → Ensembl ID → (HGNC table) → HGNC numeric ID
 
     Fallback (when Ensembl mapping fails):
-        Entrez ID → (geneinfo) → gene_symbol → (BMG table, bmg_symbol_col) → BMGid
+        Entrez ID → (geneinfo) → gene_symbol → (HGNC symbol/alias/prev_symbol) → HGNC numeric ID
 
     Vocabulary format (aligned with data_process_v0.0.py):
-        {"<pad>": 0, "<cls>": 1, "BMGC_GN00001": 2, "BMGC_GN00002": 3, ...}
+        {"<pad>": 0, "<cls>": 1, "5": 2, "7": 3, ...}
+        (keys are HGNC numeric ID strings extracted from "HGNC:5")
 
     Args:
         gctx_entrez: List of Entrez IDs from gctx ROW metadata
-        geneinfo_path: Path to geneinfo_beta.txt (Entrez → Ensembl mapping)
-        bmg_path: Path to BioMedGraphica gene table
-        bmg_sep: CSV separator (None for auto-detect)
-        bmg_ensembl_col: Column name for Ensembl ID in BMG table
-        bmg_id_col: Column name for BMG identifier
-        bmg_symbol_col: Column name for gene symbol in BMG table (fallback mapping)
+        geneinfo_path: Path to geneinfo_beta.txt (Entrez → Ensembl + gene_symbol)
+        hgnc_path: Path to hgnc_complete_set.txt (tab-separated)
         out_dir: Output directory
 
     Returns:
-        map_arr: int32 array of length G, map_arr[g] = BMG token id (0 = <pad>/unmapped)
-        vocab: {BMGid: token_id} dictionary
+        map_arr: int32 array of length G, map_arr[g] = HGNC token id (0 = <pad>/unmapped)
+        vocab: {HGNC_numeric_id_str: token_id} dictionary
 
     Outputs:
-        gene_vocab.json                     - BMGid → token_id (dict)
-        conn_id_to_hgnc.json                - BMGid → gene symbol (for interpretation)
-        gene_map_gctxindex_to_bmgtoken.npy  - gctx gene index → token id
-        gctx_gene_to_bmgid.tsv              - Readable debug table
+        gene_vocab.json                      - HGNC numeric ID → token_id (dict)
+        conn_id_to_hgnc.json                 - HGNC numeric ID → gene symbol (for interpretation)
+        gene_map_gctxindex_to_hgnctoken.npy  - gctx gene index → token id
+        gctx_gene_to_hgncid.tsv             - Readable debug table
     """
-    # ---- geneinfo: Entrez → Ensembl ----
+    # ---- geneinfo: Entrez → Ensembl + gene_symbol ----
     gi = pd.read_csv(geneinfo_path, sep="\t", dtype=str,
                      usecols=["gene_id", "ensembl_id", "gene_symbol"])
     gi["entrez_id"] = gi["gene_id"].astype(str)
     gi["ensembl_norm"] = gi["ensembl_id"].apply(norm_ensembl)
 
-    # ---- BMG: Ensembl → BMGid ----
-    if bmg_sep is None:
-        bmg = pd.read_csv(bmg_path, sep=None, engine="python", dtype=str)
-    else:
-        bmg = pd.read_csv(bmg_path, sep=bmg_sep, dtype=str)
+    # ---- HGNC: Load table ----
+    hgnc_df = pd.read_csv(hgnc_path, sep="\t", dtype=str, low_memory=False)
+    print(f"[HGNC] Loaded {len(hgnc_df):,} rows from {hgnc_path.name}")
 
-    if bmg_ensembl_col not in bmg.columns:
-        raise ValueError(f"BMG missing column '{bmg_ensembl_col}'. columns={bmg.columns.tolist()}")
-    if bmg_id_col not in bmg.columns:
-        raise ValueError(f"BMG missing column '{bmg_id_col}'. columns={bmg.columns.tolist()}")
+    # Extract HGNC numeric ID: "HGNC:5" → "5"
+    hgnc_df["hgnc_num"] = hgnc_df["hgnc_id"].apply(
+        lambda x: str(x).strip().split(":", 1)[-1]
+        if pd.notna(x) and ":" in str(x) else ""
+    )
 
-    bmg["ensembl_norm"] = bmg[bmg_ensembl_col].apply(norm_ensembl)
-    bmg["bmgid"] = bmg[bmg_id_col].astype(str)
-
-    # Deduplicate by Ensembl (keep first match; ~310 duplicates expected)
-    bmg2 = bmg.loc[
-        bmg["ensembl_norm"] != "",
-        ["ensembl_norm", "bmgid"]
+    # ---- HGNC: Ensembl → HGNC numeric ID (primary lookup) ----
+    hgnc_df["ensembl_norm"] = hgnc_df["ensembl_gene_id"].apply(norm_ensembl)
+    hgnc_ens = hgnc_df.loc[
+        (hgnc_df["ensembl_norm"] != "") & (hgnc_df["hgnc_num"] != ""),
+        ["ensembl_norm", "hgnc_num"]
     ].drop_duplicates("ensembl_norm", keep="first")
 
-    # ---- BMG: Symbol → BMGid (fallback lookup) ----
-    symbol_to_bmgid: Dict[str, str] = {}
-    if bmg_symbol_col and bmg_symbol_col in bmg.columns:
-        bmg["symbol_norm"] = bmg[bmg_symbol_col].apply(
-            lambda x: str(x).strip() if pd.notna(x) and str(x).strip().lower() not in ("nan", "none", "") else ""
-        )
-        bmg_sym2 = bmg.loc[
-            bmg["symbol_norm"] != "",
-            ["symbol_norm", "bmgid"]
-        ].drop_duplicates("symbol_norm", keep="first")
-        symbol_to_bmgid = dict(zip(bmg_sym2["symbol_norm"], bmg_sym2["bmgid"]))
-        print(f"[GENE MAP] BMG symbol lookup built ({bmg_symbol_col}): {len(symbol_to_bmgid):,} unique symbols")
-    else:
-        print(f"[GENE MAP] Warning: '{bmg_symbol_col}' not in BMG columns, skipping symbol fallback")
+    # ---- HGNC: Symbol/alias/prev_symbol → HGNC numeric ID (fallback lookup) ----
+    hgnc_valid = hgnc_df[hgnc_df["hgnc_num"] != ""].copy()
+    symbol_to_hgnc_num: Dict[str, str] = {}
 
-    # ---- Join: Entrez → Ensembl → BMGid (primary) ----
+    sym_df = hgnc_valid[["symbol", "hgnc_num"]].dropna(subset=["symbol"]).copy()
+    sym_df["symbol"] = sym_df["symbol"].str.strip()
+    sym_df = sym_df[sym_df["symbol"] != ""]
+    symbol_to_hgnc_num.update(dict(zip(sym_df["symbol"], sym_df["hgnc_num"])))
+    symbol_to_hgnc_num.update(dict(zip(sym_df["symbol"].str.upper(), sym_df["hgnc_num"])))
+
+    for col in ("alias_symbol", "prev_symbol"):
+        if col not in hgnc_valid.columns:
+            continue
+        a_df = hgnc_valid[["hgnc_num", col]].dropna(subset=[col]).copy()
+        a_df[col] = a_df[col].str.strip().str.strip('"')
+        a_df = a_df[a_df[col] != ""]
+        a_exp = a_df.assign(**{col: a_df[col].str.split("|")}).explode(col)
+        a_exp[col] = a_exp[col].str.strip()
+        a_exp = a_exp[a_exp[col] != ""]
+        symbol_to_hgnc_num.update(dict(zip(a_exp[col], a_exp["hgnc_num"])))
+        symbol_to_hgnc_num.update(dict(zip(a_exp[col].str.upper(), a_exp["hgnc_num"])))
+
+    print(f"[GENE MAP] HGNC Ensembl lookup: {len(hgnc_ens):,} entries, "
+          f"symbol lookup: {len(symbol_to_hgnc_num):,} entries")
+
+    # ---- Join: Entrez → Ensembl → HGNC numeric ID (primary) ----
     # Keep ALL genes (including those without Ensembl ID) so symbol fallback can apply
     gi2 = gi[["entrez_id", "ensembl_norm", "gene_symbol"]].copy()
-    gi2 = gi2.merge(bmg2, on="ensembl_norm", how="left")
-    # Rows with ensembl_norm=="" or no BMG match → bmgid is NaN
+    gi2 = gi2.merge(hgnc_ens, on="ensembl_norm", how="left")
+    # Rows with ensembl_norm=="" or no HGNC match → hgnc_num is NaN
 
-    # ---- Symbol fallback: gene_symbol → HGNC_Symbol → BMGid ----
-    if symbol_to_bmgid:
-        primary_failed = gi2["bmgid"].isna() | gi2["bmgid"].str.lower().isin(["nan", "none", ""])
+    # ---- Symbol fallback: gene_symbol → HGNC symbol/alias → HGNC numeric ID ----
+    if symbol_to_hgnc_num:
+        primary_failed = gi2["hgnc_num"].isna() | gi2["hgnc_num"].str.lower().isin(["nan", "none", ""])
         if primary_failed.any():
             gi2["_sym"] = gi2["gene_symbol"].apply(
                 lambda x: str(x).strip() if pd.notna(x) and str(x).strip().lower() not in ("nan", "none", "") else ""
             )
             can_fallback = primary_failed & (gi2["_sym"] != "")
-            gi2.loc[can_fallback, "bmgid"] = gi2.loc[can_fallback, "_sym"].map(symbol_to_bmgid)
+            gi2.loc[can_fallback, "hgnc_num"] = gi2.loc[can_fallback, "_sym"].map(symbol_to_hgnc_num)
             gi2.drop(columns=["_sym"], inplace=True)
 
-            still_failed = gi2["bmgid"].isna() | gi2["bmgid"].str.lower().isin(["nan", "none", ""])
+            still_failed = gi2["hgnc_num"].isna() | gi2["hgnc_num"].str.lower().isin(["nan", "none", ""])
             n_ensembl = (~primary_failed).sum()
             n_symbol  = (primary_failed & ~still_failed).sum()
             print(f"[GENE MAP] Mapped via Ensembl: {n_ensembl:,}, via symbol fallback: {n_symbol:,}, still unmapped: {still_failed.sum():,}")
 
-    entrez_to_bmgid = dict(zip(gi2["entrez_id"], gi2["bmgid"]))
+    entrez_to_hgncid = dict(zip(gi2["entrez_id"], gi2["hgnc_num"]))
     entrez_to_symbol = dict(zip(gi2["entrez_id"], gi2["gene_symbol"]))
 
     # ---- Build vocabulary (dict format, matching v0.0) ----
-    # Collect all valid BMGids that appear in gctx genes
-    bmgids_in_gctx = []
+    # Collect all valid HGNC numeric IDs that appear in gctx genes
+    hgnc_ids_in_gctx = []
     for e in gctx_entrez:
-        bid = entrez_to_bmgid.get(str(e), None)
-        if bid is not None and str(bid).lower() not in ("nan", "none", ""):
-            bmgids_in_gctx.append(str(bid))
-    uniq_bmgids = sorted(set(bmgids_in_gctx))
+        hid = entrez_to_hgncid.get(str(e), None)
+        if hid is not None and str(hid).lower() not in ("nan", "none", ""):
+            hgnc_ids_in_gctx.append(str(hid))
+    # Sort numerically for consistent ordering
+    uniq_hgnc_ids = sorted(set(hgnc_ids_in_gctx), key=lambda x: int(x) if x.isdigit() else 0)
 
-    # vocab: <pad>=0, <cls>=1, BMGid=2...
+    # vocab: <pad>=0, <cls>=1, HGNC_numeric_id_str=2...
     vocab: Dict[str, int] = {"<pad>": 0, "<cls>": 1}
-    for bid in uniq_bmgids:
-        vocab[bid] = len(vocab)
+    for hid in uniq_hgnc_ids:
+        vocab[hid] = len(vocab)
 
     (out_dir / "gene_vocab.json").write_text(json.dumps(vocab, indent=2))
     print(f"[VOCAB] Saved vocab (size={len(vocab)}) -> {out_dir / 'gene_vocab.json'}")
 
-    # ---- Build conn_id_to_hgnc (for interpretation) ----
+    # ---- Build conn_id_to_hgnc (HGNC numeric ID → gene symbol, for interpretation) ----
     conn_to_hgnc: Dict[str, str] = {"<pad>": "<pad>", "<cls>": "<cls>"}
     for e in gctx_entrez:
-        bid = entrez_to_bmgid.get(str(e), None)
+        hid = entrez_to_hgncid.get(str(e), None)
         sym = entrez_to_symbol.get(str(e), "")
-        if bid and str(bid) in vocab and str(bid) not in conn_to_hgnc:
-            conn_to_hgnc[str(bid)] = str(sym) if sym else ""
+        if hid and str(hid) in vocab and str(hid) not in conn_to_hgnc:
+            conn_to_hgnc[str(hid)] = str(sym) if sym else ""
     (out_dir / "conn_id_to_hgnc.json").write_text(json.dumps(conn_to_hgnc, indent=2))
     print(f"[VOCAB] Saved conn_id_to_hgnc -> {out_dir / 'conn_id_to_hgnc.json'}")
 
@@ -305,13 +307,13 @@ def step_build_gene_mapping(
     map_arr = np.zeros((G,), dtype=np.int32)  # 0 = <pad>/unmapped
     miss = 0
     for g, e in enumerate(gctx_entrez):
-        bid = entrez_to_bmgid.get(str(e), None)
-        if bid is None or str(bid).lower() in ("nan", "none", ""):
+        hid = entrez_to_hgncid.get(str(e), None)
+        if hid is None or str(hid).lower() in ("nan", "none", ""):
             miss += 1
             continue
-        map_arr[g] = vocab.get(str(bid), 0)
+        map_arr[g] = vocab.get(str(hid), 0)
 
-    np.save(out_dir / "gene_map_gctxindex_to_bmgtoken.npy", map_arr)
+    np.save(out_dir / "gene_map_gctxindex_to_hgnctoken.npy", map_arr)
     print(f"[GENE MAP] gctx genes={G:,}, mapped={G - miss:,}, unmapped={miss:,}")
 
     # ---- Debug table ----
@@ -320,12 +322,12 @@ def step_build_gene_mapping(
         "entrez_id": [str(x) for x in gctx_entrez]
     })
     tmp = tmp.merge(
-        gi2[["entrez_id", "ensembl_norm", "gene_symbol", "bmgid"]],
+        gi2[["entrez_id", "ensembl_norm", "gene_symbol", "hgnc_num"]],
         on="entrez_id", how="left"
     )
-    tmp["bmgtoken"] = map_arr
-    tmp.to_csv(out_dir / "gctx_gene_to_bmgid.tsv", sep="\t", index=False)
-    print(f"[GENE MAP] Saved debug table -> gctx_gene_to_bmgid.tsv")
+    tmp["hgnctoken"] = map_arr
+    tmp.to_csv(out_dir / "gctx_gene_to_hgncid.tsv", sep="\t", index=False)
+    print(f"[GENE MAP] Saved debug table -> gctx_gene_to_hgncid.tsv")
 
     return map_arr, vocab
 
@@ -435,7 +437,7 @@ def step_load_metadata(
 def step_tokenize_shards(
     gctx_path: Path,
     out_dir: Path,
-    map_g_to_bmgtoken: np.ndarray,
+    map_g_to_hgnctoken: np.ndarray,
     cond_keep: pd.DataFrame,
     # hyperparameters
     topk: int,
@@ -452,7 +454,7 @@ def step_tokenize_shards(
 
     Tokenization (per signature):
       1. Select Top-(K+EXTRA) genes by abs(expression)
-      2. Map gctx gene indices → BMG token ids
+      2. Map gctx gene indices → HGNC token ids
       3. Drop unmapped genes (token==0), keep first K
       4. Rank-based binning: higher bin = higher expression, bin 0 = padding
       5. Pad to K with <pad>=0
@@ -464,7 +466,7 @@ def step_tokenize_shards(
     Args:
         gctx_path: Path to gctx file
         out_dir: Output directory
-        map_g_to_bmgtoken: int32[G], gctx gene index → BMG token id (0=unmapped)
+        map_g_to_hgnctoken: int32[G], gctx gene index → HGNC token id (0=unmapped)
         cond_keep: Metadata DataFrame indexed by sample_id (standardized columns)
         topk: Max genes per signature = sequence length
         n_bins: Number of expression bins
@@ -545,8 +547,8 @@ def step_tokenize_shards(
             order = np.argsort(-top_vals, axis=1)
             idx_sorted = np.take_along_axis(idx_top, order, axis=1).astype(np.int32)
 
-            # ---- Map to BMG tokens ----
-            bmg_tokens_all = map_g_to_bmgtoken[idx_sorted]  # (B, K0), 0=unmapped
+            # ---- Map to HGNC tokens ----
+            bmg_tokens_all = map_g_to_hgnctoken[idx_sorted]  # (B, K0), 0=unmapped
 
             # ---- Keep first TOPK mapped genes; pad with 0 if needed ----
             B = bmg_tokens_all.shape[0]
@@ -667,13 +669,13 @@ def parse_args() -> argparse.Namespace:
 
     Argument groups:
         Input: --gctx, --conditional, --cellinfo, --compoundinfo, --geneinfo
-        BMG mapping: --bmg, --bmg_sep, --bmg_ensembl_col, --bmg_id_col
+        HGNC mapping: --hgnc
         Output: --out_dir
         Hyperparameters: --topk, --n_bins, --chunk_rows, --shard_size, --extra
         Metadata: --text_cols, --use_abs
     """
     p = argparse.ArgumentParser(
-        description="CLUE/L1000 level3 gctx -> BMG-token shards (server-friendly)."
+        description="CLUE/L1000 level3 gctx -> HGNC-token shards (server-friendly)."
     )
 
     # === Input ===
@@ -688,17 +690,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--geneinfo", type=str, required=True,
                    help="Path to geneinfo table (TSV, Entrez → Ensembl mapping)")
 
-    # === BMG Gene Mapping ===
-    p.add_argument("--bmg", type=str, required=True,
-                   help="Path to BioMedGraphica gene table (csv/tsv)")
-    p.add_argument("--bmg_sep", type=str, default=None,
-                   help="BMG separator: ',' or '\\t' (default: auto-detect)")
-    p.add_argument("--bmg_ensembl_col", type=str, default="Ensembl_Gene_ID",
-                   help="Ensembl column name in BMG table (default: Ensembl_Gene_ID)")
-    p.add_argument("--bmg_id_col", type=str, default="BioMedGraphica_Conn_ID",
-                   help="BMG identifier column name (default: BioMedGraphica_Conn_ID)")
-    p.add_argument("--bmg_symbol_col", type=str, default="HGNC_Symbol",
-                   help="Symbol column in BMG table for fallback mapping when Ensembl fails (default: HGNC_Symbol)")
+    # === HGNC Gene Mapping ===
+    p.add_argument("--hgnc", type=str, required=True,
+                   help="Path to hgnc_complete_set.txt (tab-separated)")
 
     # === Output ===
     p.add_argument("--out_dir", type=str, required=True,
@@ -734,7 +728,7 @@ def main():
 
     Flow:
         Step 0: Load metadata (conditional + cellinfo + compoundinfo)
-        Step 1: Build gene mapping (Entrez → Ensembl → BMGid) + vocabulary
+        Step 1: Build gene mapping (Entrez → Ensembl → HGNC numeric ID) + vocabulary
         Step 2: Tokenize and shard
         Step 3: Save domain mapping
     """
@@ -781,14 +775,10 @@ def main():
     print(f"[REF] Saved genes_symbol.json")
 
     # Build mapping
-    map_g_to_bmgtoken, _vocab = step_build_gene_mapping(
+    map_g_to_hgnctoken, _vocab = step_build_gene_mapping(
         gctx_entrez=gctx_entrez,
         geneinfo_path=Path(args.geneinfo),
-        bmg_path=Path(args.bmg),
-        bmg_sep=args.bmg_sep,
-        bmg_ensembl_col=args.bmg_ensembl_col,
-        bmg_id_col=args.bmg_id_col,
-        bmg_symbol_col=args.bmg_symbol_col,
+        hgnc_path=Path(args.hgnc),
         out_dir=out_dir,
     )
 
@@ -801,7 +791,7 @@ def main():
     domain_map = step_tokenize_shards(
         gctx_path=gctx_path,
         out_dir=out_dir,
-        map_g_to_bmgtoken=map_g_to_bmgtoken,
+        map_g_to_hgnctoken=map_g_to_hgnctoken,
         cond_keep=cond_keep,
         topk=args.topk,
         n_bins=args.n_bins,
@@ -825,14 +815,14 @@ def main():
     print("All done!")
     print("=" * 60)
     print(f"\nOutput files:")
-    print(f"  - {out_dir / 'gene_vocab.json'}                     <- Gene vocab (BMGid -> token_id)")
-    print(f"  - {out_dir / 'conn_id_to_hgnc.json'}               <- BMGid -> gene symbol")
-    print(f"  - {out_dir / 'gene_map_gctxindex_to_bmgtoken.npy'}  <- gctx index -> token_id")
-    print(f"  - {out_dir / 'gctx_gene_to_bmgid.tsv'}             <- Debug mapping table")
-    print(f"  - {out_dir / 'genes_entrez.json'}                   <- Entrez gene list")
-    print(f"  - {out_dir / 'genes_symbol.json'}                   <- Gene symbols")
-    print(f"  - {out_dir / 'domain_map.json'}                     <- Domain mapping")
-    print(f"  - {out_dir / 'shards/'}                             <- Tokenized data shards")
+    print(f"  - {out_dir / 'gene_vocab.json'}                      <- Gene vocab (HGNC numeric ID -> token_id)")
+    print(f"  - {out_dir / 'conn_id_to_hgnc.json'}                <- HGNC numeric ID -> gene symbol")
+    print(f"  - {out_dir / 'gene_map_gctxindex_to_hgnctoken.npy'} <- gctx index -> token_id")
+    print(f"  - {out_dir / 'gctx_gene_to_hgncid.tsv'}             <- Debug mapping table")
+    print(f"  - {out_dir / 'genes_entrez.json'}                    <- Entrez gene list")
+    print(f"  - {out_dir / 'genes_symbol.json'}                    <- Gene symbols")
+    print(f"  - {out_dir / 'domain_map.json'}                      <- Domain mapping")
+    print(f"  - {out_dir / 'shards/'}                              <- Tokenized data shards")
 
 
 if __name__ == "__main__":

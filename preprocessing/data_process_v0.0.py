@@ -26,29 +26,27 @@ Step 1: Cell QC filtering + HVG selection
   - Output:
       * hvg_genes.txt   (original gene names, one per line)
 
-Step 1.5 (Optional): BioMedGraphica gene mapping (normalization + KG alignment)
-  - If --biomedgraphica is provided, maps HVG genes to:
+Step 1.5 (Optional): HGNC gene mapping (normalization + standardization)
+  - If --hgnc is provided, maps HVG genes to:
       * HGNC symbols
-      * BioMedGraphica_Conn_ID (recommended as KG node id)
+      * HGNC numeric ID (the integer from "HGNC:5", used as gene node id)
   - Keeps only genes successfully mapped
   - Outputs:
       * hvg_genes_hgnc.txt        (mapped HGNC symbols)
-      * hvg_genes_conn_id.txt     (mapped BioMedGraphica_Conn_ID list)
+      * hvg_genes_hgnc_id.txt     (mapped HGNC numeric ID list)
       * gene_mapping_info.json    (mapping details and rates)
 
 Step 2: Build gene vocabulary (token ids)
   - Builds a token dictionary with special tokens:
       * <pad> = 0
       * <cls> = 1
-  - If BioMedGraphica mapping is enabled, the intended design is:
-      * vocabulary keys are BioMedGraphica_Conn_ID (so gene_ids align with KG nodes)
+  - If HGNC mapping is enabled, the intended design is:
+      * vocabulary keys are HGNC numeric IDs as strings (e.g., "5" from "HGNC:5")
     Otherwise:
       * vocabulary keys are original gene names
   - Outputs:
       * gene_vocab.json
-      * conn_id_to_hgnc.json
-        NOTE: In the current implementation, conn_id_to_hgnc may become an identity mapping
-              unless build_gene_vocab(...) is called with the (conn_ids, hgnc) pairs.
+      * conn_id_to_hgnc.json  (hgnc_numeric_id_str -> HGNC_Symbol)
 
 Step 3: Per-gene quantile bin edges
   - Loads a sampled subset of cells (after the same QC+doublet filtering)
@@ -285,107 +283,66 @@ def normalize_log1p_inplace(adata: sc.AnnData, target_sum: float = 1e4) -> None:
     sc.pp.normalize_total(adata, target_sum=target_sum)
     sc.pp.log1p(adata)
 
-def load_biomedgraphica_mapping(csv_path: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
+def load_hgnc_mapping(hgnc_path: Path) -> Tuple[Dict[str, int], Dict[str, str]]:
     """
-    Load BioMedGraphica gene mapping table.
-
-    BioMedGraphica is a biomedical knowledge graph providing standardized gene nomenclature.
-    HGNC_Symbol is the official gene symbol from the Human Gene Nomenclature Committee.
+    Load HGNC complete gene set mapping table.
 
     Args:
-        csv_path: Path to BioMedGraphica_Conn_Gene.csv
+        hgnc_path: Path to hgnc_complete_set.txt (tab-separated)
 
     Returns:
-        hgnc_to_conn_id: {HGNC_Symbol: BioMedGraphica_Conn_ID} mapping
-        gene_aliases: {Possible Alias: HGNC_Symbol} for matching different formats
+        symbol_to_hgnc_num: {HGNC_Symbol: hgnc_numeric_id}
+            e.g., {"A1BG": 5}  (extracted from "HGNC:5")
+        gene_aliases: {possible_name: HGNC_Symbol} for matching different formats
+            includes symbol, alias_symbol, prev_symbol, ensembl_gene_id
 
-    File format:
-        BioMedGraphica_Conn_ID, ..., HGNC_Symbol
-        BMGC_GN00001, ..., A1BG
+    File format (tab-separated):
+        hgnc_id  symbol  ...  alias_symbol  prev_symbol  ensembl_gene_id  ...
+        HGNC:5   A1BG    ...
     """
-    print(f"[BIOMEDGRAPHICA] Loading mapping from {csv_path} ...")
-    df = pd.read_csv(csv_path, usecols=['BioMedGraphica_Conn_ID', 'HGNC_Symbol', 'Ensembl_Gene_ID', 'Gene_Name'])
+    print(f"[HGNC] Loading mapping from {hgnc_path} ...")
+    df = pd.read_csv(hgnc_path, sep="\t", dtype=str, low_memory=False)
 
-    # Main mapping: HGNC_Symbol -> BioMedGraphica_Conn_ID
-    hgnc_to_conn_id = {}
-    # Alias mapping: various possible gene names -> HGNC_Symbol (for matching)
-    gene_aliases = {}
+    symbol_to_hgnc_num: Dict[str, int] = {}
+    gene_aliases: Dict[str, str] = {}
 
     for _, row in df.iterrows():
-        hgnc = str(row['HGNC_Symbol']).strip()
-        conn_id = str(row['BioMedGraphica_Conn_ID']).strip()
+        hgnc_id_str = str(row.get("hgnc_id", "")).strip()
+        symbol = str(row.get("symbol", "")).strip()
 
-        if pd.isna(row['HGNC_Symbol']) or hgnc == 'nan' or hgnc == '':
+        if not hgnc_id_str or hgnc_id_str == "nan" or not symbol or symbol == "nan":
             continue
 
-        hgnc_to_conn_id[hgnc] = conn_id
+        # Extract numeric part: "HGNC:5" -> 5
+        try:
+            hgnc_num = int(hgnc_id_str.split(":", 1)[-1])
+        except (ValueError, IndexError):
+            continue
 
-        # Add various possible aliases for matching
-        gene_aliases[hgnc] = hgnc  # Self
-        gene_aliases[hgnc.upper()] = hgnc  # Uppercase
-        gene_aliases[hgnc.lower()] = hgnc  # Lowercase
+        symbol_to_hgnc_num[symbol] = hgnc_num
 
-        # Ensembl ID also serves as an alias
-        if pd.notna(row['Ensembl_Gene_ID']):
-            ensembl_ids = str(row['Ensembl_Gene_ID']).split(';')
-            for eid in ensembl_ids:
-                eid = eid.strip()
-                if eid:
-                    gene_aliases[eid] = hgnc
+        # Alias mapping: symbol itself + case variants
+        for s in (symbol, symbol.upper(), symbol.lower()):
+            gene_aliases[s] = symbol
 
-    print(f"[BIOMEDGRAPHICA] Loaded {len(hgnc_to_conn_id)} HGNC symbols")
-    return hgnc_to_conn_id, gene_aliases
+        # alias_symbol and prev_symbol (pipe-separated, may be quoted)
+        for col in ("alias_symbol", "prev_symbol"):
+            val = str(row.get(col, "")).strip().strip('"')
+            if val and val != "nan":
+                for alias in val.split("|"):
+                    a = alias.strip()
+                    if a:
+                        gene_aliases[a] = symbol
+                        gene_aliases[a.upper()] = symbol
 
+        # Ensembl gene ID as alias
+        ensembl = str(row.get("ensembl_gene_id", "")).strip()
+        if ensembl and ensembl != "nan":
+            gene_aliases[ensembl] = symbol
 
-def map_genes_to_hgnc(gene_names: List[str],
-                      gene_aliases: Dict[str, str],
-                      hgnc_to_conn_id: Dict[str, str]) -> Tuple[List[str], List[str], Dict[str, str]]:
-    """
-    Map gene name list to HGNC standard symbols.
-
-    Args:
-        gene_names: List of original gene names (from adata.var_names)
-        gene_aliases: Alias -> HGNC_Symbol mapping
-        hgnc_to_conn_id: HGNC_Symbol -> BioMedGraphica_Conn_ID mapping
-
-    Returns:
-        mapped_genes: List of successfully mapped HGNC_Symbols
-        conn_ids: List of corresponding BioMedGraphica_Conn_IDs
-        original_to_hgnc: {Original Gene Name: HGNC_Symbol} mapping (for later index conversion)
-    """
-    mapped_genes = []
-    conn_ids = []
-    original_to_hgnc = {}
-    unmapped = []
-
-    for gene in gene_names:
-        gene_str = str(gene).strip()
-
-        # Attempt direct match
-        if gene_str in gene_aliases:
-            hgnc = gene_aliases[gene_str]
-            if hgnc in hgnc_to_conn_id:
-                mapped_genes.append(hgnc)
-                conn_ids.append(hgnc_to_conn_id[hgnc])
-                original_to_hgnc[gene] = hgnc
-                continue
-
-        # Attempt uppercase match
-        if gene_str.upper() in gene_aliases:
-            hgnc = gene_aliases[gene_str.upper()]
-            if hgnc in hgnc_to_conn_id:
-                mapped_genes.append(hgnc)
-                conn_ids.append(hgnc_to_conn_id[hgnc])
-                original_to_hgnc[gene] = hgnc
-                continue
-
-        unmapped.append(gene_str)
-
-    print(f"[GENE MAPPING] Mapped: {len(mapped_genes)}/{len(gene_names)} genes")
-    if unmapped:
-        print(f"[GENE MAPPING] Unmapped examples: {unmapped[:10]}...")
-
-    return mapped_genes, conn_ids, original_to_hgnc
+    print(f"[HGNC] Loaded {len(symbol_to_hgnc_num):,} HGNC symbols, "
+          f"{len(gene_aliases):,} alias entries")
+    return symbol_to_hgnc_num, gene_aliases
 
 
 def build_gene_vocab(gene_names: List[str],
@@ -801,9 +758,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0,
                    help="Random seed (default: 0)")
 
-    # === BioMedGraphica Gene Mapping ===
-    p.add_argument("--biomedgraphica", type=str, default=None,
-                   help="Path to BioMedGraphica_Conn_Gene.csv, used to map gene names to HGNC standard symbols")
+    # === HGNC Gene Mapping ===
+    p.add_argument("--hgnc", type=str, default=None,
+                   help="Path to hgnc_complete_set.txt, used to map gene names to HGNC numeric IDs")
     
         # === QC Parameters ===
     p.add_argument("--min_genes", type=int, default=500)
@@ -836,15 +793,15 @@ def main():
     ensure_dir(out_dir)
 
     # =========================================================================
-    # Step 0 Load BioMedGraphica Gene Mapping
+    # Step 0 Load HGNC Gene Mapping
     # =========================================================================
-    hgnc_to_conn_id = None
+    symbol_to_hgnc_num = None
     gene_aliases = None
-    if args.biomedgraphica:
-        biomedgraphica_path = Path(args.biomedgraphica)
-        if not biomedgraphica_path.exists():
-            raise FileNotFoundError(f"BioMedGraphica file not found: {biomedgraphica_path}")
-        hgnc_to_conn_id, gene_aliases = load_biomedgraphica_mapping(biomedgraphica_path)
+    if args.hgnc:
+        hgnc_path = Path(args.hgnc)
+        if not hgnc_path.exists():
+            raise FileNotFoundError(f"HGNC file not found: {hgnc_path}")
+        symbol_to_hgnc_num, gene_aliases = load_hgnc_mapping(hgnc_path)
 
     # =========================================================================
     # Step 1: HVG Selection
@@ -867,38 +824,38 @@ def main():
     )
 
     # =========================================================================
-    # Step 2 Map gene names to BioMedGraphica_Conn_ID
+    # Step 2 Map gene names to HGNC numeric ID
     # =========================================================================
     # hvg_genes_for_adata: Original gene names for indexing adata
-    # hvg_genes_for_vocab: Identifiers for vocab building (BioMedGraphica_Conn_ID or original names)
+    # hvg_genes_for_vocab: Identifiers for vocab building (HGNC numeric ID strings or original names)
     hvg_genes_for_adata = hvg_genes_original
     hvg_genes_for_vocab = hvg_genes_original  # Default to original gene names
 
-    if hgnc_to_conn_id is not None:
+    if symbol_to_hgnc_num is not None:
         print("\n" + "="*60)
-        print("[GENE MAPPING] Mapping gene names to HGNC symbols...")
+        print("[GENE MAPPING] Mapping gene names to HGNC numeric IDs...")
         print("="*60)
 
         # Map gene names
         mapped_hgnc = []
-        mapped_conn_ids = []
-        mapped_original = []  # Corresponding original gene names (for indexing adata)
+        mapped_hgnc_ids = []            # HGNC numeric ID strings, e.g. "5"
+        mapped_original = []            # Corresponding original gene names (for indexing adata)
 
         unmapped = []
         for gene in hvg_genes_original:
             gene_str = str(gene).strip()
 
-            # Attempt match
+            # Attempt match via alias table
             hgnc = None
             if gene_str in gene_aliases:
                 hgnc = gene_aliases[gene_str]
             elif gene_str.upper() in gene_aliases:
                 hgnc = gene_aliases[gene_str.upper()]
 
-            if hgnc and hgnc in hgnc_to_conn_id:
+            if hgnc and hgnc in symbol_to_hgnc_num:
                 mapped_hgnc.append(hgnc)
-                mapped_conn_ids.append(hgnc_to_conn_id[hgnc])
-                mapped_original.append(gene)  # Save original gene name
+                mapped_hgnc_ids.append(str(symbol_to_hgnc_num[hgnc]))  # e.g. "5"
+                mapped_original.append(gene)
             else:
                 unmapped.append(gene_str)
 
@@ -907,15 +864,15 @@ def main():
             print(f"[GENE MAPPING] Unmapped examples: {unmapped[:10]}...")
 
         # Keep only mapped genes
-        hvg_genes_for_adata = mapped_original      # Original gene names for indexing adata
-        hvg_genes_for_vocab = mapped_conn_ids      # BioMedGraphica_Conn_ID for vocab (as KG node IDs)
-        hvg_genes_hgnc = mapped_hgnc               # HGNC symbols for saving mapping relations
+        hvg_genes_for_adata = mapped_original    # Original gene names for indexing adata
+        hvg_genes_for_vocab = mapped_hgnc_ids    # HGNC numeric ID strings for vocab keys
+        hvg_genes_hgnc = mapped_hgnc             # HGNC symbols for saving mapping relations
 
         # Save mapping relations
         mapping_info = {
             'original_to_hgnc': dict(zip(mapped_original, mapped_hgnc)),
-            'hgnc_to_conn_id': dict(zip(mapped_hgnc, mapped_conn_ids)),
-            'conn_id_to_hgnc': dict(zip(mapped_conn_ids, mapped_hgnc)),  # Reverse mapping for explanation
+            'hgnc_to_hgnc_id': dict(zip(mapped_hgnc, mapped_hgnc_ids)),
+            'hgnc_id_to_hgnc': dict(zip(mapped_hgnc_ids, mapped_hgnc)),
             'total_original': len(hvg_genes_original),
             'total_mapped': len(mapped_hgnc),
             'mapping_rate': f"{len(mapped_hgnc)/len(hvg_genes_original)*100:.1f}%"
@@ -923,19 +880,19 @@ def main():
         (out_dir / "gene_mapping_info.json").write_text(json.dumps(mapping_info, indent=2, ensure_ascii=False))
         print(f"[GENE MAPPING] Saved mapping info -> {out_dir / 'gene_mapping_info.json'}")
 
-        # Save HGNC gene list and Conn_ID list
+        # Save HGNC symbol list and HGNC numeric ID list
         (out_dir / "hvg_genes_hgnc.txt").write_text("\n".join(hvg_genes_hgnc))
         print(f"[GENE MAPPING] Saved HGNC gene list ({len(hvg_genes_hgnc)} genes) -> {out_dir / 'hvg_genes_hgnc.txt'}")
 
-        (out_dir / "hvg_genes_conn_id.txt").write_text("\n".join(hvg_genes_for_vocab))
-        print(f"[GENE MAPPING] Saved BioMedGraphica_Conn_ID list ({len(hvg_genes_for_vocab)} genes) -> {out_dir / 'hvg_genes_conn_id.txt'}")
+        (out_dir / "hvg_genes_hgnc_id.txt").write_text("\n".join(hvg_genes_for_vocab))
+        print(f"[GENE MAPPING] Saved HGNC numeric ID list ({len(hvg_genes_for_vocab)} genes) -> {out_dir / 'hvg_genes_hgnc_id.txt'}")
 
     # =========================================================================
     # Step 3: Build Gene Vocabulary
-    # When using BioMedGraphica mapping: vocab key is directly BioMedGraphica_Conn_ID
-    # Thus the output gene_ids directly correspond to Knowledge Graph node IDs.
+    # When using HGNC mapping: vocab key is HGNC numeric ID string (e.g. "5")
+    # Thus the output gene_ids directly correspond to HGNC node IDs.
     # =========================================================================
-    vocab, conn_to_hgnc = build_gene_vocab(hvg_genes_for_vocab, None)  # hvg_genes_for_vocab is already Conn_ID
+    vocab, conn_to_hgnc = build_gene_vocab(hvg_genes_for_vocab, None)  # hvg_genes_for_vocab is already HGNC ID str
     (out_dir / "gene_vocab.json").write_text(json.dumps(vocab, indent=2))
     print(f"[VOCAB] Saved vocab (size={len(vocab)}) -> {out_dir / 'gene_vocab.json'}")
 
@@ -985,14 +942,14 @@ def main():
     print(f"  - {out_dir / 'hvg_genes.txt'}              <- HVG list (Original gene names)")
     print(f"  - {out_dir / 'gene_bin_edges.npy'}         <- Per-gene bin edges")
     print(f"  - {out_dir / 'shards/'}                    <- Tokenized data shards")
-    if args.biomedgraphica:
-        print(f"  - {out_dir / 'gene_vocab.json'}            <- Gene Vocabulary (BioMedGraphica_Conn_ID -> ID)")
-        print(f"  - {out_dir / 'hvg_genes_conn_id.txt'}      <- BioMedGraphica_Conn_ID list")
+    if args.hgnc:
+        print(f"  - {out_dir / 'gene_vocab.json'}            <- Gene Vocabulary (HGNC numeric ID -> token_id)")
+        print(f"  - {out_dir / 'hvg_genes_hgnc_id.txt'}      <- HGNC numeric ID list")
         print(f"  - {out_dir / 'hvg_genes_hgnc.txt'}         <- HGNC standard symbol list")
-        print(f"  - {out_dir / 'conn_id_to_hgnc.json'}       <- Conn_ID -> HGNC mapping (for explanation)")
+        print(f"  - {out_dir / 'conn_id_to_hgnc.json'}       <- HGNC numeric ID -> symbol (for explanation)")
         print(f"  - {out_dir / 'gene_mapping_info.json'}     <- Gene mapping details")
     else:
-        print(f"  - {out_dir / 'gene_vocab.json'}            <- Gene Vocabulary (Original gene names -> ID)")
+        print(f"  - {out_dir / 'gene_vocab.json'}            <- Gene Vocabulary (Original gene names -> token_id)")
         print(f"  - {out_dir / 'conn_id_to_hgnc.json'}       <- Gene name mapping")
 
 if __name__ == "__main__":
