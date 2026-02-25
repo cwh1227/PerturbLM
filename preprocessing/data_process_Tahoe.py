@@ -21,9 +21,16 @@ Step 0: Load metadata
 
 Step 1: Build gene vocabulary
   - Load gene_metadata (gene_symbol, ensembl_id, token_id)
+  - Load hgnc_complete_set.txt
+  - Mapping chain (primary):  ensembl_id (gene_metadata) → ensembl_gene_id (HGNC) → HGNC numeric ID
+  - Mapping chain (fallback): gene_symbol (gene_metadata) → symbol/alias (HGNC) → HGNC numeric ID
+  - Build vocabulary (dict format, aligned with single-cell / L1000 pipeline):
+      {"<pad>": 0, "<cls>": 1, "5": 2, ...}  (keys are HGNC numeric ID strings)
+  - Build mapping array: original token_id → new HGNC token_id (for fast lookup during Step 2)
   - Outputs:
-      * gene_vocab.json         (ensembl_id → token_id)
-      * conn_id_to_hgnc.json    (ensembl_id → gene_symbol, for interpretation)
+      * gene_vocab.json              (HGNC numeric ID → token_id)
+      * conn_id_to_hgnc.json        (HGNC numeric ID → gene_symbol, for interpretation)
+      * gene_token_to_hgncid.tsv    (debug: original token_id → HGNC numeric ID)
 
 Step 2: Tokenize + shard
   - Stream expression_data in batches
@@ -52,9 +59,14 @@ Design notes
 =============================================================================
 
 Token space:
-  - token_id is taken directly from gene_metadata (Tahoe provides this natively).
-  - No Entrez→Ensembl→BMGid mapping is needed (unlike L1000 gctx).
-  - gene_vocab.json uses ensembl_id as keys (equivalent role to BMGid in L1000).
+  - Vocabulary keys are HGNC numeric IDs (e.g., "5" from "HGNC:5"), identical to
+    the single-cell pipeline (data_process_v0.0.py) and L1000 pipeline
+    (data_process_L1000_v0.1.py). This allows multi-modal pretraining where Tahoe,
+    L1000 signatures, and single-cell data share the same gene token space.
+  - Tahoe gene_metadata provides ensembl_id + gene_symbol; these are mapped to HGNC
+    numeric IDs via hgnc_complete_set.txt (Ensembl primary, symbol fallback).
+  - A mapping array (original token_id → new HGNC token_id) is built in Step 1 and
+    applied during Step 2 tokenization.
 
 Text data alignment:
   - Same 15 standard columns as L1000 and single-cell pipelines.
@@ -78,6 +90,7 @@ Example
 
 python data_process_Tahoe.py \
   --dataset_dir /path/to/Tahoe-100M \
+  --hgnc hgnc_complete_set.txt \
   --out_dir out_Tahoe \
   --topk 1024 --n_bins 32 --batch_size 4096 --shard_size 50000 --use_abs
 
@@ -111,6 +124,23 @@ except Exception as e:
 def ensure_dir(p: Path) -> None:
     """Create directory (and parents) if it doesn't exist."""
     p.mkdir(parents=True, exist_ok=True)
+
+
+def norm_ensembl(x: str) -> str:
+    """
+    Normalize Ensembl gene ID:
+      - Strip whitespace
+      - Drop version suffix (e.g. ENSG00000001234.5 → ENSG00000001234)
+      - Return "" for invalid/missing values
+    """
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() in ("", "nan", "na", "none"):
+        return ""
+    if s.startswith("ENS") and "." in s:
+        s = s.split(".", 1)[0]
+    return s
 
 
 def safe_str(x) -> str:
@@ -304,41 +334,166 @@ def step_load_metadata(
 def step_build_gene_vocab(
     dataset_dir: Path,
     subset_split: str,
+    hgnc_path: Path,
     out_dir: Path,
-) -> None:
+) -> np.ndarray:
     """
-    Step 1: Load gene_metadata and save reference files.
+    Step 1: Build HGNC-based gene vocabulary from gene_metadata + hgnc_complete_set.txt.
 
-    gene_metadata columns (from dataset):
-      gene_symbol, ensembl_id, token_id
+    Mapping chain (primary):
+        gene_metadata.ensembl_id → (HGNC table) → HGNC numeric ID
+
+    Fallback (when Ensembl mapping fails):
+        gene_metadata.gene_symbol → (HGNC symbol/alias/prev_symbol) → HGNC numeric ID
+
+    Vocabulary format (aligned with data_process_v0.0.py and L1000 pipeline):
+        {"<pad>": 0, "<cls>": 1, "5": 2, "7": 3, ...}
+        (keys are HGNC numeric ID strings extracted from "HGNC:5")
+
+    Args:
+        dataset_dir: Root directory of Tahoe-100M dataset
+        subset_split: HF split name (e.g., "train")
+        hgnc_path: Path to hgnc_complete_set.txt (tab-separated)
+        out_dir: Output directory
+
+    Returns:
+        orig_to_hgnctoken: int32 array of length max_orig_token_id+1,
+            where orig_to_hgnctoken[orig_token_id] = new_hgnc_token_id (0=unmapped)
 
     Outputs:
-      gene_vocab.json        - {ensembl_id: token_id, "<pad>": 0, "<cls>": 1}
-      conn_id_to_hgnc.json   - {ensembl_id: gene_symbol}
+        gene_vocab.json           - HGNC numeric ID → token_id (dict)
+        conn_id_to_hgnc.json      - HGNC numeric ID → gene symbol (for interpretation)
+        gene_token_to_hgncid.tsv  - Debug: original token_id → HGNC numeric ID
     """
+    # ---- Load gene_metadata ----
     gene_ds = load_from_disk(str(dataset_dir / "gene_metadata"))[subset_split]
     gene_df = gene_ds.to_pandas()
     print(f"[VOCAB] gene_metadata rows: {len(gene_df):,}")
 
-    # Normalize and drop rows with missing ensembl_id or token_id
     gene_df = gene_df.dropna(subset=["ensembl_id", "token_id"]).copy()
-    gene_df["ensembl_norm"] = gene_df["ensembl_id"].astype(str).str.strip()
-    gene_df = gene_df[~gene_df["ensembl_norm"].str.lower().isin(["nan", "none", ""])]
+    gene_df["ensembl_norm"]  = gene_df["ensembl_id"].astype(str).apply(norm_ensembl)
+    gene_df["orig_token_id"] = gene_df["token_id"].astype(int)
+
+    # ---- Load HGNC ----
+    hgnc_df = pd.read_csv(hgnc_path, sep="\t", dtype=str, low_memory=False)
+    print(f"[HGNC] Loaded {len(hgnc_df):,} rows from {hgnc_path.name}")
+
+    # Extract HGNC numeric ID: "HGNC:5" → "5"
+    hgnc_df["hgnc_num"] = hgnc_df["hgnc_id"].apply(
+        lambda x: str(x).strip().split(":", 1)[-1]
+        if pd.notna(x) and ":" in str(x) else ""
+    )
+
+    # ---- Primary lookup: Ensembl → HGNC numeric ID ----
+    hgnc_df["ensembl_norm"] = hgnc_df["ensembl_gene_id"].apply(norm_ensembl)
+    hgnc_ens = hgnc_df.loc[
+        (hgnc_df["ensembl_norm"] != "") & (hgnc_df["hgnc_num"] != ""),
+        ["ensembl_norm", "hgnc_num"]
+    ].drop_duplicates("ensembl_norm", keep="first")
+
+    # ---- Fallback lookup: symbol/alias/prev_symbol → HGNC numeric ID ----
+    hgnc_valid = hgnc_df[hgnc_df["hgnc_num"] != ""].copy()
+    symbol_to_hgnc_num: Dict[str, str] = {}
+
+    sym_df = hgnc_valid[["symbol", "hgnc_num"]].dropna(subset=["symbol"]).copy()
+    sym_df["symbol"] = sym_df["symbol"].str.strip()
+    sym_df = sym_df[sym_df["symbol"] != ""]
+    symbol_to_hgnc_num.update(dict(zip(sym_df["symbol"], sym_df["hgnc_num"])))
+    symbol_to_hgnc_num.update(dict(zip(sym_df["symbol"].str.upper(), sym_df["hgnc_num"])))
+
+    for col in ("alias_symbol", "prev_symbol"):
+        if col not in hgnc_valid.columns:
+            continue
+        a_df = hgnc_valid[["hgnc_num", col]].dropna(subset=[col]).copy()
+        a_df[col] = a_df[col].str.strip().str.strip('"')
+        a_df = a_df[a_df[col] != ""]
+        a_exp = a_df.assign(**{col: a_df[col].str.split("|")}).explode(col)
+        a_exp[col] = a_exp[col].str.strip()
+        a_exp = a_exp[a_exp[col] != ""]
+        symbol_to_hgnc_num.update(dict(zip(a_exp[col], a_exp["hgnc_num"])))
+        symbol_to_hgnc_num.update(dict(zip(a_exp[col].str.upper(), a_exp["hgnc_num"])))
+
+    print(f"[GENE MAP] HGNC Ensembl lookup: {len(hgnc_ens):,} entries, "
+          f"symbol lookup: {len(symbol_to_hgnc_num):,} entries")
+
+    # ---- Join gene_metadata with HGNC by Ensembl ID ----
+    gene_df2 = gene_df[["orig_token_id", "ensembl_norm", "gene_symbol"]].copy()
+    gene_df2 = gene_df2.merge(hgnc_ens, on="ensembl_norm", how="left")
+
+    # ---- Symbol fallback ----
+    if symbol_to_hgnc_num:
+        primary_failed = (
+            gene_df2["hgnc_num"].isna() |
+            gene_df2["hgnc_num"].str.lower().isin(["nan", "none", ""])
+        )
+        if primary_failed.any():
+            gene_df2["_sym"] = gene_df2["gene_symbol"].apply(
+                lambda x: str(x).strip()
+                if pd.notna(x) and str(x).strip().lower() not in ("nan", "none", "") else ""
+            )
+            can_fallback = primary_failed & (gene_df2["_sym"] != "")
+            gene_df2.loc[can_fallback, "hgnc_num"] = (
+                gene_df2.loc[can_fallback, "_sym"].map(symbol_to_hgnc_num)
+            )
+            gene_df2.drop(columns=["_sym"], inplace=True)
+
+            still_failed = (
+                gene_df2["hgnc_num"].isna() |
+                gene_df2["hgnc_num"].str.lower().isin(["nan", "none", ""])
+            )
+            n_ensembl = (~primary_failed).sum()
+            n_symbol  = (primary_failed & ~still_failed).sum()
+            print(f"[GENE MAP] Mapped via Ensembl: {n_ensembl:,}, "
+                  f"via symbol fallback: {n_symbol:,}, "
+                  f"still unmapped: {still_failed.sum():,}")
+
+    # ---- Build vocabulary (HGNC numeric ID strings, sorted numerically) ----
+    valid_mask = (
+        gene_df2["hgnc_num"].notna() &
+        ~gene_df2["hgnc_num"].str.lower().isin(["nan", "none", ""])
+    )
+    uniq_hgnc_ids = sorted(
+        set(gene_df2.loc[valid_mask, "hgnc_num"]),
+        key=lambda x: int(x) if x.isdigit() else 0
+    )
 
     vocab: Dict[str, int] = {"<pad>": 0, "<cls>": 1}
-    vocab.update(
-        dict(zip(gene_df["ensembl_norm"], gene_df["token_id"].astype(int)))
-    )
-    conn_to_hgnc: Dict[str, str] = {"<pad>": "<pad>", "<cls>": "<cls>"}
-    conn_to_hgnc.update(
-        dict(zip(gene_df["ensembl_norm"], gene_df["gene_symbol"].astype(str)))
-    )
+    for hid in uniq_hgnc_ids:
+        vocab[hid] = len(vocab)
 
     (out_dir / "gene_vocab.json").write_text(json.dumps(vocab, indent=2))
     print(f"[VOCAB] Saved gene_vocab.json (size={len(vocab):,}) -> {out_dir / 'gene_vocab.json'}")
 
+    # ---- Build conn_id_to_hgnc (HGNC numeric ID → gene symbol) ----
+    conn_to_hgnc: Dict[str, str] = {"<pad>": "<pad>", "<cls>": "<cls>"}
+    for _, row in gene_df2[valid_mask].iterrows():
+        hid = str(row["hgnc_num"])
+        sym = str(row["gene_symbol"]) if pd.notna(row.get("gene_symbol")) else ""
+        if hid in vocab and hid not in conn_to_hgnc:
+            conn_to_hgnc[hid] = sym
+
     (out_dir / "conn_id_to_hgnc.json").write_text(json.dumps(conn_to_hgnc, indent=2))
     print(f"[VOCAB] Saved conn_id_to_hgnc.json -> {out_dir / 'conn_id_to_hgnc.json'}")
+
+    # ---- Build orig_token_id → hgnc_token_id mapping array ----
+    # Array index = original token_id, value = new HGNC token_id (0 = unmapped)
+    max_orig = int(gene_df2["orig_token_id"].max())
+    orig_to_hgnctoken = np.zeros(max_orig + 1, dtype=np.int32)
+
+    mapped_df = gene_df2[valid_mask].copy()
+    mapped_df["hgnc_token"] = mapped_df["hgnc_num"].map(vocab).fillna(0).astype(int)
+    for row in mapped_df[["orig_token_id", "hgnc_token"]].itertuples(index=False):
+        orig_to_hgnctoken[int(row.orig_token_id)] = int(row.hgnc_token)
+
+    # ---- Debug table ----
+    gene_df2["hgnc_token"] = gene_df2["orig_token_id"].apply(
+        lambda t: int(orig_to_hgnctoken[int(t)]) if 0 <= int(t) <= max_orig else 0
+    )
+    gene_df2.to_csv(out_dir / "gene_token_to_hgncid.tsv", sep="\t", index=False)
+    print(f"[GENE MAP] Total genes: {len(gene_df2):,}, mapped: {valid_mask.sum():,}")
+    print(f"[GENE MAP] Saved debug table -> gene_token_to_hgncid.tsv")
+
+    return orig_to_hgnctoken
 
 
 # =============================================================================
@@ -391,15 +546,27 @@ def tokenize_one(
     topk: int,
     n_bins: int,
     use_abs: bool,
+    orig_to_hgnctoken: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Tokenize one observation.
+
+    Applies orig_to_hgnctoken mapping to convert original token_ids (from
+    gene_metadata) to HGNC-based token_ids before selection and binning.
 
     Binning convention (matching v0.0 / L1000):
       bin = n_bins - (rank * n_bins) // L
       rank 0 (highest expression) → bin n_bins
       rank L-1 (lowest expression) → bin 1
       padding positions remain 0
+
+    Args:
+        genes: Original token_ids from expression_data
+        exprs: Expression values
+        topk: Max genes per observation
+        n_bins: Number of expression bins
+        use_abs: Rank by abs(expression) if True
+        orig_to_hgnctoken: int32 array, index=orig_token_id, value=hgnc_token_id (0=unmapped)
 
     Returns:
         gene_ids[topk], bin_ids[topk], length
@@ -413,9 +580,14 @@ def tokenize_one(
     L0 = min(g.size, x.size)
     g, x = g[:L0], x[:L0]
 
-    # Drop invalid token ids (0 is reserved for <pad>)
-    keep = g > 0
-    g, x = g[keep], x[keep]
+    # Map original token_ids → HGNC token_ids (vectorized)
+    n_map = len(orig_to_hgnctoken)
+    in_range = (g >= 0) & (g < n_map)
+    g_hgnc = np.where(in_range, orig_to_hgnctoken[np.clip(g, 0, n_map - 1)], 0)
+
+    # Drop unmapped (0 = <pad> / unmapped)
+    keep = g_hgnc > 0
+    g, x = g_hgnc[keep].astype(np.int64), x[keep]
 
     if g.size == 0:
         return np.zeros((topk,), dtype=np.int32), np.zeros((topk,), dtype=np.int16), 0
@@ -450,6 +622,7 @@ def step_tokenize_shards(
     dataset_dir: Path,
     out_dir: Path,
     obs_keep: pd.DataFrame,
+    orig_to_hgnctoken: np.ndarray,
     topk: int,
     n_bins: int,
     batch_size: int,
@@ -466,12 +639,14 @@ def step_tokenize_shards(
     Mirrors L1000's step_tokenize_shards:
       - obs_keep (indexed by BARCODE_SUB_LIB_ID) replaces cond_keep (indexed by sample_id)
       - expression_data streaming replaces gctx chunk reading
-      - token ids are already in the data (no gene index → token mapping needed)
+      - orig_to_hgnctoken maps original token_ids → HGNC token_ids (analogous to
+        gene_map_gctxindex_to_hgnctoken.npy in L1000)
 
     Args:
         dataset_dir: Root Tahoe-100M directory
         out_dir: Output directory
         obs_keep: DataFrame indexed by BARCODE_SUB_LIB_ID (from step_load_metadata)
+        orig_to_hgnctoken: int32 array, index=orig_token_id, value=hgnc_token_id (0=unmapped)
         topk: Max genes per observation = sequence length
         n_bins: Number of rank-based expression bins
         batch_size: HF streaming batch size
@@ -540,7 +715,8 @@ def step_tokenize_shards(
             g_list = as_list(genes_batch[orig_i])
             x_list = as_list(exprs_batch[orig_i])
             g_ids, b_ids, L = tokenize_one(
-                g_list, x_list, topk=topk, n_bins=n_bins, use_abs=use_abs
+                g_list, x_list, topk=topk, n_bins=n_bins, use_abs=use_abs,
+                orig_to_hgnctoken=orig_to_hgnctoken,
             )
             out_gene[bi] = g_ids
             out_bin[bi]  = b_ids
@@ -622,6 +798,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--expression_subset", type=str, default="expression_data",
                    help="Expression data subfolder name (default: expression_data)")
 
+    # === HGNC Gene Mapping ===
+    p.add_argument("--hgnc", type=str, required=True,
+                   help="Path to hgnc_complete_set.txt (tab-separated)")
+
     # === QC ===
     p.add_argument("--qc_col", type=str, default="pass_filter",
                    help="obs_metadata column for QC filtering (default: pass_filter)")
@@ -690,9 +870,10 @@ def main():
     print("\n" + "=" * 60)
     print("[Step 1] Building gene vocabulary ...")
     print("=" * 60)
-    step_build_gene_vocab(
+    orig_to_hgnctoken = step_build_gene_vocab(
         dataset_dir=dataset_dir,
         subset_split=args.subset_split,
+        hgnc_path=Path(args.hgnc),
         out_dir=out_dir,
     )
 
@@ -706,6 +887,7 @@ def main():
         dataset_dir=dataset_dir,
         out_dir=out_dir,
         obs_keep=obs_keep,
+        orig_to_hgnctoken=orig_to_hgnctoken,
         topk=args.topk,
         n_bins=args.n_bins,
         batch_size=args.batch_size,
@@ -729,10 +911,11 @@ def main():
     print("All done!")
     print("=" * 60)
     print(f"\nOutput files:")
-    print(f"  - {out_dir / 'gene_vocab.json'}        <- ensembl_id → token_id")
-    print(f"  - {out_dir / 'conn_id_to_hgnc.json'}   <- ensembl_id → gene symbol")
-    print(f"  - {out_dir / 'domain_map.json'}         <- domain mapping")
-    print(f"  - {out_dir / 'shards/'}                 <- tokenized data shards")
+    print(f"  - {out_dir / 'gene_vocab.json'}             <- HGNC numeric ID → token_id")
+    print(f"  - {out_dir / 'conn_id_to_hgnc.json'}        <- HGNC numeric ID → gene symbol")
+    print(f"  - {out_dir / 'gene_token_to_hgncid.tsv'}    <- Debug: original token_id → HGNC numeric ID")
+    print(f"  - {out_dir / 'domain_map.json'}              <- domain mapping")
+    print(f"  - {out_dir / 'shards/'}                      <- tokenized data shards")
 
 
 if __name__ == "__main__":
