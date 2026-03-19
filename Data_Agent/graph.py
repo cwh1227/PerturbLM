@@ -22,7 +22,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
 from Agent.state import AgentState
-from Agent.tools import ALL_TOOLS
+from Agent.tools import ALL_TOOLS, ALL_TOOLS_ATAC
 
 
 SYSTEM_PROMPT = """You are a genomics data-processing agent.
@@ -123,6 +123,95 @@ For a new data format: add only a read_* tool that writes the standard
 cell_meta.parquet + gene_meta.parquet schema.  Steps 3–6 work unchanged.
 """
 
+SYSTEM_PROMPT_ATAC = """You are an ATAC-seq key-feature extraction agent.
+
+Your job is to produce standardized ATAC gene-score outputs from either:
+  A) a peak-to-gene table file (.csv/.tsv/.txt/.parquet), or
+  B) a scATAC bundle directory (contains peak_bc/ with obs.csv, var.csv, counts.mtx.gz).
+
+Final output (always the same schema):
+    gene                     str      [G]
+    n_peaks                  int32    [G]
+    mean_distance            float64  [G]
+    median_distance          float64  [G]
+    mean_abs_distance        float64  [G]
+    composite_score          float64  [G]  — mean(|distance|) by default
+    weighted_composite_score float64  [G]  — openness-weighted distance mean (when openness available)
+    rank                     int32    [G]
+
+WORKFLOW
+────────
+Reading and aggregation are separated.  Step 2 is format-specific;
+steps 3–4 are completely format-agnostic (same tools, same intermediate files).
+
+Intermediate files written to intermediate_dir:
+  cell_meta.parquet      — per-cell QC metrics, qc_pass flag  (bundle mode only)
+  peak_meta.parquet      — per-peak features from var.csv      (bundle mode only)
+  peak_gene_link.parquet — peak-to-gene links: peak_id, gene_symbol,
+                           distance_to_tss, openness, link_type, is_valid_link
+  data_source.json       — source format, paths, column names used
+
+1. INSPECT  — understand format before doing anything:
+   inspect_atac_table(path)         → flat file
+   inspect_atac_bundle(dataset_dir) → bundle directory
+
+2. READ  — parse raw input, write standardized intermediate files:
+   ┌───────────────────────────────┬──────────────────────────────────────────────────────────┐
+   │ Input type                    │ Tool                                                     │
+   ├───────────────────────────────┼──────────────────────────────────────────────────────────┤
+   │ Flat peak-to-gene table       │ read_atac_table(path, intermediate_dir,                  │
+   │                               │   gene_col, distance_col, openness_col)                  │
+   │                               │ Writes: peak_gene_link.parquet + data_source.json        │
+   │                               │ No cell_meta (flat tables have no cell-level info)       │
+   ├───────────────────────────────┼──────────────────────────────────────────────────────────┤
+   │ scATAC bundle directory       │ read_atac_bundle(dataset_dir, intermediate_dir,          │
+   │                               │   gene_col, distance_col)                                │
+   │                               │ Writes: cell_meta + peak_meta + peak_gene_link +        │
+   │                               │         data_source.json                                 │
+   │                               │ Matrix NOT loaded here — deferred to step 4              │
+   └───────────────────────────────┴──────────────────────────────────────────────────────────┘
+
+   CRITICAL — decide from inspect output:
+     gene_col      gene symbol column (e.g. nearestGene)
+     distance_col  peak-to-TSS distance column (e.g. distToTSS)
+     openness_col  optional openness/intensity (flat table only)
+
+3. QC FILTER  — same tool for ALL formats:
+   qc_filter_atac_cells(intermediate_dir,
+     min_tss_enrichment=4.0, min_frip=0.15,
+     min_fragments=3000, max_blacklist_ratio=0.05)
+
+   Reads/writes cell_meta.parquet; updates qc_pass column.
+   AUTOMATICALLY SKIPPED for flat table input (data_source.json has_cell_meta=false).
+   Standardized QC columns: tss_enrichment, frip, n_fragments, blacklist_ratio.
+   Absent columns are silently skipped.
+
+4. AGGREGATE  — same tool for ALL formats:
+   aggregate_peaks_to_genes(intermediate_dir, out_dir,
+     use_absolute_distance=True, min_peaks_per_gene=1)
+
+   Reads peak_gene_link.parquet + data_source.json (+ cell_meta + matrix for bundle).
+   Bundle mode: loads counts.mtx.gz, applies QC cell mask, computes per-peak openness.
+   Flat table:  uses openness column already in peak_gene_link.parquet.
+
+   Writes to out_dir:
+     atac_gene_scores.tsv
+     atac_gene_scores.parquet
+     atac_gene_scores_summary.json
+
+RULES
+─────
+- Always inspect first — never guess columns or shapes.
+- After each tool call, check returned JSON for "error" and stop if found.
+- If required columns are missing, stop and report exact missing names.
+- After all steps succeed, summarize n_genes, openness_source, and out_dir.
+
+EXTENSIBILITY
+─────────────
+For a new ATAC source format: add only a read_atac_* tool that writes the standard
+cell_meta + peak_meta + peak_gene_link + data_source schema.
+Steps 3–4 (qc_filter_atac_cells, aggregate_peaks_to_genes) work unchanged.
+"""
 
 # ---------------------------------------------------------------------------
 # LLM factory — selects provider based on the `provider` argument
@@ -172,6 +261,30 @@ def _create_llm(provider: str, model: str) -> Any:
         f"Unknown provider '{provider}'. "
         "Choose from: anthropic, openai, qwen, deepseek"
     )
+
+
+def build_graph_atac(model: str = "claude-sonnet-4-6", provider: str = "anthropic") -> Any:
+    """Build and compile the ATAC LangGraph ReAct agent."""
+    llm = _create_llm(provider, model)
+    llm_with_tools = llm.bind_tools(ALL_TOOLS_ATAC)
+
+    def agent_node(state: AgentState) -> dict:
+        return {"messages": [llm_with_tools.invoke(state["messages"])]}
+
+    def should_continue(state: AgentState) -> str:
+        last = state["messages"][-1]
+        if isinstance(last, AIMessage) and last.tool_calls:
+            return "tools"
+        return END
+
+    g = StateGraph(AgentState)
+    g.add_node("agent", agent_node)
+    g.add_node("tools", ToolNode(ALL_TOOLS_ATAC))
+    g.set_entry_point("agent")
+    g.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+    g.add_edge("tools", "agent")
+
+    return g.compile()
 
 
 def build_graph(model: str = "claude-sonnet-4-6", provider: str = "anthropic") -> Any:

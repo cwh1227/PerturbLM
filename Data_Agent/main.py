@@ -2,8 +2,14 @@
 CLI entry point for the genomics data-processing agent.
 
 Usage:
-    # Anthropic Claude (default)
+    # RNA pipeline (default)
     python -m Agent.main --files cells.h5ad hgnc_complete_set.txt --out_dir out_SC
+
+    # ATAC pipeline — flat table
+    python -m Agent.main --mode atac --files peak_to_gene.tsv --out_dir out_atac
+
+    # ATAC pipeline — bundle directory
+    python -m Agent.main --mode atac --files /path/to/dataset_dir --out_dir out_atac
 
     # OpenAI GPT-4o
     python -m Agent.main --files ... --provider openai --model gpt-4o --out_dir out_SC
@@ -21,6 +27,7 @@ Usage:
     python -m Agent.main --draw
 
 Config YAML format:
+    mode: rna                    # rna (default) | atac
     files:
       - /path/to/data.h5ad
       - /path/to/hgnc_complete_set.txt
@@ -49,7 +56,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from Agent.graph import SYSTEM_PROMPT, build_graph
+from Agent.graph import SYSTEM_PROMPT, SYSTEM_PROMPT_ATAC, build_graph, build_graph_atac
 from Agent.state import AgentState
 
 
@@ -63,6 +70,46 @@ def _make_prompt(files: list, out_dir: str, instructions: str = "") -> str:
         "Start by inspecting the files to understand their format, then execute "
         "the appropriate pipeline steps.",
     ]
+    if instructions:
+        lines += ["", f"Additional instructions: {instructions}"]
+    return "\n".join(lines)
+
+
+def _make_prompt_atac(files: list[str], out_dir: str, instructions: str = "") -> str:
+    from pathlib import Path
+    resolved_paths = [Path(f) for f in files]
+    dataset_dirs = [str(p) for p in resolved_paths if p.exists() and p.is_dir()]
+    data_files = [str(p) for p in resolved_paths if not (p.exists() and p.is_dir())]
+
+    lines = [
+        f"Process the following ATAC inputs and write gene-level output to: {out_dir}",
+        "",
+        "Input paths:",
+        *[f"  - {f}" for f in files],
+        "",
+    ]
+
+    if dataset_dirs:
+        lines += [
+            "Detected directory-style ATAC bundle input(s).",
+            "Use bundle workflow with QC by default:",
+            "1) inspect_atac_bundle(dataset_dir)",
+            "2) compute_atac_gene_scores_from_bundle(dataset_dir, out_dir,",
+            "   gene_col='nearestGene', distance_col='distToTSS',",
+            "   min_tss_enrichment=4.0, min_frip=0.15,",
+            "   min_fragments=3000, max_blacklist_ratio=0.05,",
+            "   min_peak_cells=5, min_peaks_per_gene=3)",
+        ]
+
+    if data_files:
+        lines += [
+            "For flat table input(s), use:",
+            "1) inspect_atac_table(path)",
+            "2) compute_atac_gene_scores(path, out_dir, gene_col, distance_col, openness_col)",
+        ]
+
+    lines += ["", "Always inspect first, then compute per-gene composite_score."]
+
     if instructions:
         lines += ["", f"Additional instructions: {instructions}"]
     return "\n".join(lines)
@@ -98,6 +145,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Genomics data-processing agent  (LangGraph + Claude)"
     )
+    parser.add_argument("--mode", default="rna", choices=["rna", "atac"],
+                        help="Pipeline mode: rna (default) or atac")
     parser.add_argument("--files", nargs="+", help="Input file path(s)")
     parser.add_argument("--out_dir", default="out_agent", help="Output directory")
     parser.add_argument("--config", help="YAML config file")
@@ -118,9 +167,16 @@ def main() -> None:
         files        = cfg.get("files", files)
         out_dir      = cfg.get("out_dir", out_dir)
         instructions = cfg.get("instructions", instructions)
+        if args.mode == "rna" and cfg.get("mode"):
+            args.mode = cfg["mode"]
 
     provider, model = _resolve_provider_and_model(args, cfg)
-    graph = build_graph(model=model, provider=provider)
+    mode = args.mode
+
+    if mode == "atac":
+        graph = build_graph_atac(model=model, provider=provider)
+    else:
+        graph = build_graph(model=model, provider=provider)
 
     if args.draw:
         try:
@@ -133,11 +189,16 @@ def main() -> None:
         parser.error("Provide files via --files or a YAML config with 'files' key.")
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    print(f"\n[AGENT] Starting  |  provider={provider}  model={model}  out_dir={out_dir}")
+    print(f"\n[AGENT] Starting  |  mode={mode}  provider={provider}  model={model}  out_dir={out_dir}")
     print(f"[AGENT] Files: {files}\n")
 
+    if mode == "atac":
+        prompt = SYSTEM_PROMPT_ATAC + "\n\n" + _make_prompt_atac(files, out_dir, instructions)
+    else:
+        prompt = SYSTEM_PROMPT + "\n\n" + _make_prompt(files, out_dir, instructions)
+
     initial: AgentState = {
-        "messages": [HumanMessage(content=SYSTEM_PROMPT + "\n\n" + _make_prompt(files, out_dir, instructions))],
+        "messages": [HumanMessage(content=prompt)],
         "out_dir": out_dir,
         "intermediate_dir": "",
     }

@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Unified Omics Pipeline Diagram</title>
+  <style>
+    :root {
+      --bg: #fffaf2;
+      --panel: #fff4dd;
+      --panel-2: #fff8ea;
+      --accent: #ef6c00;
+      --accent-dark: #cc4e00;
+      --accent-soft: #ffb55e;
+      --line: #f3b56a;
+      --text: #5a3b20;
+      --muted: #8c6a4f;
+      --shadow: 0 18px 40px rgba(214, 128, 24, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, #fff6df 0, #fffaf2 42%, #fffefb 100%);
+      color: var(--text);
+      font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    }
+
+    .wrap {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+
+    .frame {
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid rgba(243, 181, 106, 0.55);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      padding: 28px;
+      backdrop-filter: blur(6px);
+    }
+
+    .title {
+      margin: 0 0 18px;
+      padding: 20px 24px;
+      border-radius: 20px;
+      color: #fff;
+      font-size: 34px;
+      font-weight: 800;
+      text-align: center;
+      letter-spacing: 0.2px;
+      background: linear-gradient(90deg, #e85d04 0%, #f48c06 55%, #ffb703 100%);
+      box-shadow: 0 10px 24px rgba(239, 108, 0, 0.25);
+    }
+
+    .subtitle {
+      margin: 0 0 22px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    svg {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    .hint {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .hint code {
+      background: #fff0d0;
+      border: 1px solid #f2c27d;
+      border-radius: 6px;
+      padding: 2px 6px;
+      color: #7a4d1d;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="frame">
+      <h1 class="title">Unified Omics Processing Agent Pipeline</h1>
+      <p class="subtitle">
+        A publication-ready SVG/HTML template based on the workflow implemented in <code>graph.py</code>
+      </p>
+
+      <svg viewBox="0 0 1400 1220" xmlns="http://www.w3.org/2000/svg" aria-labelledby="diagramTitle diagramDesc" role="img">
+        <title id="diagramTitle">Unified Omics Processing Agent Pipeline</title>
+        <desc id="diagramDesc">
+          Diagram showing a shared LangGraph inspection and tool-calling framework that dispatches RNA and ATAC inputs into two preprocessing branches.
+        </desc>
+
+        <defs>
+          <linearGradient id="headerGrad" x1="0%" x2="100%" y1="0%" y2="0%">
+            <stop offset="0%" stop-color="#eb5e28"/>
+            <stop offset="55%" stop-color="#f48c06"/>
+            <stop offset="100%" stop-color="#ffbe0b"/>
+          </linearGradient>
+          <linearGradient id="panelGrad" x1="0%" x2="0%" y1="0%" y2="100%">
+            <stop offset="0%" stop-color="#fff8ea"/>
+            <stop offset="100%" stop-color="#fff0d5"/>
+          </linearGradient>
+          <linearGradient id="boxGrad" x1="0%" x2="0%" y1="0%" y2="100%">
+            <stop offset="0%" stop-color="#fffdfa"/>
+            <stop offset="100%" stop-color="#fff0d9"/>
+          </linearGradient>
+          <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+            <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#d68018" flood-opacity="0.16"/>
+          </filter>
+          <marker id="arrow" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto">
+            <path d="M0,0 L14,7 L0,14 z" fill="#d45500"/>
+          </marker>
+          <style>
+            .panel { fill: url(#panelGrad); stroke: #f2bf79; stroke-width: 2; filter: url(#softShadow); }
+            .box { fill: url(#boxGrad); stroke: #ec9a3c; stroke-width: 2; }
+            .box-soft { fill: #fff8ec; stroke: #efb469; stroke-width: 2; }
+            .headerText { fill: #c44700; font-size: 28px; font-weight: 800; }
+            .sectionTitle { fill: #d45500; font-size: 24px; font-weight: 800; }
+            .label { fill: #5a3b20; font-size: 18px; font-weight: 700; }
+            .body { fill: #6f5338; font-size: 15px; }
+            .small { fill: #8b6849; font-size: 14px; }
+            .tiny { fill: #946f4f; font-size: 13px; }
+            .arrow { stroke: #d45500; stroke-width: 4; fill: none; marker-end: url(#arrow); }
+            .dashed { stroke-dasharray: 8 7; }
+            .pill { fill: #ffe8b6; stroke: #f3af4c; stroke-width: 1.5; }
+            .agentChip { fill: #fff5df; stroke: #ec9a3c; stroke-width: 2; }
+          </style>
+        </defs>
+
+        <rect x="20" y="16" width="1360" height="120" rx="26" fill="url(#headerGrad)" />
+        <text x="700" y="68" text-anchor="middle" font-size="40" font-weight="800" fill="#fff">
+          Unified Omics Processing Agent Pipeline
+        </text>
+        <text x="700" y="102" text-anchor="middle" font-size="18" fill="#fff8e8">
+          Shared LangGraph ReAct framework with RNA-seq and ATAC-seq preprocessing branches
+        </text>
+
+        <rect class="panel" x="60" y="170" width="1280" height="180" rx="24"/>
+        <text class="headerText" x="700" y="213" text-anchor="middle">General Agent Framework</text>
+
+        <rect class="agentChip" x="130" y="245" width="180" height="58" rx="16"/>
+        <text class="label" x="220" y="280" text-anchor="middle">Input Files</text>
+
+        <rect class="agentChip" x="365" y="245" width="190" height="58" rx="16"/>
+        <text class="label" x="460" y="280" text-anchor="middle">Inspect Format</text>
+
+        <rect class="agentChip" x="610" y="245" width="210" height="58" rx="16"/>
+        <text class="label" x="715" y="280" text-anchor="middle">Read / Standardize</text>
+
+        <rect class="agentChip" x="875" y="245" width="200" height="58" rx="16"/>
+        <text class="label" x="975" y="280" text-anchor="middle">Tool Calls</text>
+
+        <rect class="agentChip" x="1130" y="245" width="140" height="58" rx="16"/>
+        <text class="label" x="1200" y="280" text-anchor="middle">Outputs</text>
+
+        <path class="arrow" d="M310 274 H365"/>
+        <path class="arrow" d="M555 274 H610"/>
+        <path class="arrow" d="M820 274 H875"/>
+        <path class="arrow" d="M1075 274 H1130"/>
+        <path class="arrow dashed" d="M975 315 V335 H460 V303"/>
+        <text class="small" x="717" y="333" text-anchor="middle">agent ↔ tools loop until no more tool calls</text>
+
+        <rect class="panel" x="60" y="400" width="600" height="600" rx="24"/>
+        <text class="sectionTitle" x="360" y="443" text-anchor="middle">RNA-seq Branch</text>
+
+        <rect class="box" x="120" y="475" width="480" height="70" rx="18"/>
+        <text class="label" x="360" y="505" text-anchor="middle">Inspect RNA Input</text>
+        <text class="body" x="360" y="530" text-anchor="middle">inspect_h5ad / inspect_gctx / inspect_hf_dataset</text>
+
+        <rect class="box" x="120" y="585" width="480" height="88" rx="18"/>
+        <text class="label" x="360" y="616" text-anchor="middle">Read and Standardize</text>
+        <text class="body" x="360" y="640" text-anchor="middle">read_* → cell_meta.parquet, gene_meta.parquet, data_source.json</text>
+        <text class="tiny" x="360" y="661" text-anchor="middle">harmonized identifiers, QC fields, and metadata schema</text>
+
+        <rect class="box" x="120" y="713" width="480" height="88" rx="18"/>
+        <text class="label" x="360" y="744" text-anchor="middle">Sample-level Quality Control</text>
+        <text class="body" x="360" y="768" text-anchor="middle">dataset QC flag or computed metrics</text>
+        <text class="tiny" x="360" y="789" text-anchor="middle">n_genes, n_counts, pct_mt</text>
+
+        <rect class="box" x="120" y="841" width="480" height="70" rx="18"/>
+        <text class="label" x="360" y="871" text-anchor="middle">Feature Selection</text>
+        <text class="body" x="360" y="896" text-anchor="middle">optional select_hvg on QC-passed samples</text>
+
+        <rect class="box" x="120" y="951" width="480" height="70" rx="18"/>
+        <text class="label" x="360" y="981" text-anchor="middle">Gene Mapping and Vocabulary</text>
+        <text class="body" x="360" y="1006" text-anchor="middle">map_to_hgnc → HGNC tokens + vocabulary</text>
+
+        <rect class="box-soft" x="120" y="1061" width="480" height="92" rx="18"/>
+        <text class="label" x="360" y="1092" text-anchor="middle">Tokenization and Sharding</text>
+        <text class="body" x="360" y="1117" text-anchor="middle">rank-based expression bins + condition attributes</text>
+        <text class="tiny" x="360" y="1138" text-anchor="middle">output: shard_XXXXX.npz</text>
+
+        <path class="arrow" d="M360 545 V585"/>
+        <path class="arrow" d="M360 673 V713"/>
+        <path class="arrow" d="M360 801 V841"/>
+        <path class="arrow" d="M360 911 V951"/>
+        <path class="arrow" d="M360 1021 V1061"/>
+
+        <rect class="panel" x="740" y="400" width="600" height="600" rx="24"/>
+        <text class="sectionTitle" x="1040" y="443" text-anchor="middle">ATAC-seq Branch</text>
+
+        <rect class="box" x="800" y="475" width="480" height="70" rx="18"/>
+        <text class="label" x="1040" y="505" text-anchor="middle">Inspect ATAC Input</text>
+        <text class="body" x="1040" y="530" text-anchor="middle">inspect_atac_table / inspect_atac_bundle</text>
+
+        <rect class="box" x="800" y="585" width="480" height="88" rx="18"/>
+        <text class="label" x="1040" y="616" text-anchor="middle">Read and Standardize</text>
+        <text class="body" x="1040" y="640" text-anchor="middle">read_atac_table / read_atac_bundle → intermediate files</text>
+        <text class="tiny" x="1040" y="661" text-anchor="middle">cell_meta, peak_meta, peak_gene_link, data_source.json</text>
+
+        <rect class="box" x="800" y="713" width="480" height="88" rx="18"/>
+        <text class="label" x="1040" y="744" text-anchor="middle">Sample-level Quality Control</text>
+        <text class="body" x="1040" y="768" text-anchor="middle">qc_filter_atac_cells on standardized cell_meta.parquet</text>
+        <text class="tiny" x="1040" y="789" text-anchor="middle">bundle mode only; flat-table inputs automatically skip QC</text>
+
+        <rect class="box" x="800" y="841" width="480" height="88" rx="18"/>
+        <text class="label" x="1040" y="871" text-anchor="middle">Peak Annotation and Accessibility</text>
+        <text class="body" x="1040" y="895" text-anchor="middle">peak_meta + peak_gene_link provide gene links and distances</text>
+        <text class="tiny" x="1040" y="916" text-anchor="middle">openness from flat-table column or bundle matrix recomputation</text>
+
+        <rect class="box" x="800" y="969" width="480" height="88" rx="18"/>
+        <text class="label" x="1040" y="1000" text-anchor="middle">Gene-level Aggregation</text>
+        <text class="body" x="1040" y="1024" text-anchor="middle">aggregate_peaks_to_genes reads intermediate files + matrix</text>
+        <text class="tiny" x="1040" y="1045" text-anchor="middle">composite_score, weighted_composite_score, n_peaks</text>
+
+        <rect class="box-soft" x="800" y="1097" width="480" height="92" rx="18"/>
+        <text class="label" x="1040" y="1128" text-anchor="middle">Rank and Export</text>
+        <text class="body" x="1040" y="1153" text-anchor="middle">atac_gene_scores.tsv / .parquet / summary.json</text>
+        <text class="tiny" x="1040" y="1174" text-anchor="middle">standardized ranked gene-level chromatin accessibility outputs</text>
+
+        <path class="arrow" d="M1040 545 V585"/>
+        <path class="arrow" d="M1040 673 V713"/>
+        <path class="arrow" d="M1040 801 V841"/>
+        <path class="arrow" d="M1040 929 V969"/>
+        <path class="arrow" d="M1040 1057 V1097"/>
+
+        <path class="arrow" d="M700 350 V380"/>
+        <path class="arrow" d="M700 380 H360 V475"/>
+        <path class="arrow" d="M700 380 H1040 V475"/>
+
+        <g opacity="0.92">
+          <circle cx="130" cy="210" r="11" fill="#ffb4a2" stroke="#ea6c4e" stroke-width="2"/>
+          <circle cx="188" cy="210" r="11" fill="#ffd166" stroke="#f49f0a" stroke-width="2"/>
+          <circle cx="246" cy="210" r="11" fill="#95d5b2" stroke="#5a9c6f" stroke-width="2"/>
+          <circle cx="1195" cy="210" r="11" fill="#90caf9" stroke="#4f8cc9" stroke-width="2"/>
+          <circle cx="1253" cy="210" r="11" fill="#cdb4db" stroke="#8d6ab8" stroke-width="2"/>
+          <circle cx="1311" cy="210" r="11" fill="#80cbc4" stroke="#3d8e84" stroke-width="2"/>
+        </g>
+
+        <rect class="pill" x="145" y="320" width="145" height="32" rx="16"/>
+        <text class="tiny" x="217.5" y="341" text-anchor="middle">heterogeneous inputs</text>
+
+        <rect class="pill" x="1110" y="320" width="150" height="32" rx="16"/>
+        <text class="tiny" x="1185" y="341" text-anchor="middle">standardized outputs</text>
+      </svg>
+
+      <div class="hint">
+        Edit labels directly in <code>pipeline_diagram.html</code>. If you need a pure vector asset for Illustrator, Figma, or Inkscape,
+        use the companion file <code>pipeline_diagram.svg</code>.
+      </div>
+    </div>
+  </div>
+</body>
+</html>
