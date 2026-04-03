@@ -1,6 +1,5 @@
 BioMedGraphica_Conn_Relation.csv
 smaller_graph/
-small_graph_subgraph/
 
 # Training artifacts and model checkpoints
 *.pt
