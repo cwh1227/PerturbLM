@@ -14,8 +14,8 @@ All datasets produce identical .npz shards:
     lengths    int16   [B]        effective gene count per cell  (≤ topk)
     text_data  U       [B, 15]    tissue / region / sampleType / compartment /
                                    cellType1 / cellType2 / majorCluster / subCluster /
-                                   sex / age / perturbType / disease / drug / dose / time
-    text_cols  U       [15]       column name labels (always the same 15)
+                                   sex / age / perturbType / perturbGene / disease / drug / dose / time
+    text_cols  U       [16]       column name labels (always the same 16)
     domain_id  int32   [B]        integer domain / batch label
 
 Gene encoding:  original identifier  →  HGNC numeric ID token
@@ -41,7 +41,7 @@ from Agent.state import cell_meta_path, data_source_path, gene_meta_path
 _TEXT_COLS = [
     "tissue", "region", "sampleType", "compartment",
     "cellType1", "cellType2", "majorCluster", "subCluster",
-    "sex", "age", "perturbType", "disease", "drug", "dose", "time",
+    "sex", "age", "perturbType", "perturbGene", "disease", "drug", "dose", "time",
 ]
 
 
@@ -129,8 +129,8 @@ def tokenize(
         lengths    int16  [B]      effective gene count per cell
         text_data  U      [B, 15]  tissue / region / sampleType / compartment /
                                     cellType1 / cellType2 / majorCluster / subCluster /
-                                    sex / age / perturbType / disease / drug / dose / time
-        text_cols  U      [15]     column name labels
+                                    sex / age / perturbType / perturbGene / disease / drug / dose / time
+        text_cols  U      [16]     column name labels
         domain_id  int32  [B]      integer domain label (from domain_key column)
 
     Expression format is auto-detected from intermediate/data_source.json.

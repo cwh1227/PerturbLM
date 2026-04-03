@@ -1,16 +1,19 @@
 """
 Collect all tool functions into ALL_TOOLS for registration with the LangGraph agent.
 
-RNA pipeline (6 steps):
-  1. inspect_*        — show column names + sample values so the agent can decide mappings
-  2. read_*           — write standardized intermediate parquet files to disk
-                        (agent supplies column_map / qc_col / qc_val based on inspect output)
-  3. qc_filter_cells  — filter cells by qc_pass flag + optional numeric thresholds
-  4. select_hvg       — compute per-gene variance, mark top N as is_hvg=True
-  5. map_to_hgnc      — map ensembl_id / gene_symbol → HGNC numeric ID, build vocab
-  6. tokenize         — read parquet + original expression, write .npz shards
+RNA pipeline (7 steps):
+  1. inspect_*           — show column names + sample values so the agent can decide mappings
+  2. read_*              — write standardized intermediate parquet files to disk
+                           (agent supplies column_map / qc_col / qc_val based on inspect output)
+  3. normalize_celltypes — unify cellType1/2/majorCluster/subCluster values across datasets
+                           (resolves abbreviations like NK→Natural Killer Cell, DC→Dendritic Cell
+                            and separator/case differences; optional but recommended)
+  4. qc_filter_cells     — filter cells by qc_pass flag + optional numeric thresholds
+  5. select_hvg          — compute per-gene variance, mark top N as is_hvg=True
+  6. map_to_hgnc         — map ensembl_id / gene_symbol → HGNC numeric ID, build vocab
+  7. tokenize            — read parquet + original expression, write .npz shards
 
-Steps 3–6 read only standardized intermediate/cell_meta.parquet + gene_meta.parquet
+Steps 3–7 read only standardized intermediate/cell_meta.parquet + gene_meta.parquet
 and are completely format-agnostic.
 
 ATAC pipeline (Phase 1 — 4 steps):
@@ -33,6 +36,7 @@ from Agent.tools.read import (
 )
 from Agent.tools.qc import (
     compute_qc_metrics,
+    normalize_celltypes,
     qc_filter_cells,
     select_hvg,
 )
@@ -61,8 +65,9 @@ ALL_TOOLS = [
     read_h5ad,            # AnnData .h5ad  (column_map, qc_col, qc_val)
     read_gctx,            # L1000 gctx + siginfo/cellinfo/compoundinfo/geneinfo TSVs
     read_hf_dataset,      # HuggingFace Arrow dataset (Tahoe style)
-    # ── Step 3: QC — reads/writes cell_meta.parquet
+    # ── Step 3: QC + normalisation — reads/writes cell_meta.parquet
     compute_qc_metrics,   # compute n_genes/n_counts/pct_mt from expression matrix (when NaN)
+    normalize_celltypes,  # unify cellType1/2/majorCluster/subCluster across datasets (abbrev + case)
     qc_filter_cells,      # remove qc_pass=False + optional min/max thresholds
     # ── Step 4: HVG selection — reads gene_meta.parquet + expression (format-agnostic)
     select_hvg,           # compute variance, mark top N genes as is_hvg=True

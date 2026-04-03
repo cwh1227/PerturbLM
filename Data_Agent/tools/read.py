@@ -11,7 +11,7 @@ WORKFLOW FOR THE AGENT
 ──────────────────────
 1. Call inspect_* to see all column names and sample values.
 2. Decide:
-     - column_map : which source columns → 15 standard metadata columns
+     - column_map : which source columns → 16 standard metadata columns
      - qc_col / qc_val : which column + value marks a passing cell/sample
        (leave empty to accept all rows; apply numeric thresholds later via
         qc_filter_cells)
@@ -30,7 +30,7 @@ cell_meta.parquet
   pct_mt     float    — % mitochondrial  (NaN for bulk data)
   tissue region sampleType compartment
   cellType1 cellType2 majorCluster subCluster
-  sex age perturbType disease drug dose time
+  sex age perturbType perturbGene disease drug dose time
   ... (all original columns kept for reference)
 
 gene_meta.parquet
@@ -41,18 +41,22 @@ gene_meta.parquet
 from __future__ import annotations
 
 import json
+import re
 import traceback
 from pathlib import Path
 
 import pandas as pd
 from langchain_core.tools import tool
 
-# Standard 15 metadata columns required in every cell_meta.parquet
+# Standard 16 metadata columns required in every cell_meta.parquet
 _STD_META = [
     "tissue", "region", "sampleType", "compartment",
     "cellType1", "cellType2", "majorCluster", "subCluster",
-    "sex", "age", "perturbType", "disease", "drug", "dose", "time",
+    "sex", "age", "perturbType", "perturbGene", "disease", "drug", "dose", "time",
 ]
+
+# Columns whose *values* should be normalised for consistency across datasets
+_CELLTYPE_COLS = {"cellType1", "cellType2", "majorCluster", "subCluster"}
 
 
 def _resolve_dataset_split(ds, preferred_split: str):
@@ -62,16 +66,64 @@ def _resolve_dataset_split(ds, preferred_split: str):
     return ds
 
 
+def _col_key(name: str) -> str:
+    """Collapse case and separators for fuzzy column-name matching."""
+    return re.sub(r"[_\-\s]", "", name.lower())
+
+
+def _resolve_column(df: pd.DataFrame, src_col: str) -> str | None:
+    """Return the actual column in *df* that best matches *src_col*.
+
+    Resolution order:
+      1. Exact match
+      2. Case-insensitive match
+      3. Separator-normalised match  (ignores _ - and whitespace differences)
+
+    Returns None when no match is found.
+    """
+    if src_col in df.columns:
+        return src_col
+    lower_map = {c.lower(): c for c in df.columns}
+    if src_col.lower() in lower_map:
+        return lower_map[src_col.lower()]
+    norm_map = {_col_key(c): c for c in df.columns}
+    return norm_map.get(_col_key(src_col))
+
+
+def _normalize_celltype_value(val: str) -> str:
+    """Normalise a cell-type string so the same type maps to the same token.
+
+    - Replaces hyphens / underscores with spaces
+    - Collapses consecutive whitespace
+    - Strips leading/trailing whitespace
+    Original capitalisation is preserved (the downstream model handles that).
+    """
+    s = re.sub(r"[\-_]+", " ", str(val))
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def _apply_column_map(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
-    """Copy source columns into standard metadata column names."""
+    """Copy source columns into standard metadata column names.
+
+    Uses fuzzy column-name resolution (case-insensitive + separator-normalised)
+    so the agent does not have to match the exact capitalisation of source columns.
+    Cell-type value strings are normalised to reduce separator / spacing noise.
+    """
     for std_col, src_col in col_map.items():
-        if src_col and src_col in df.columns:
-            df[std_col] = df[src_col].astype(str).fillna("")
+        if not src_col:
+            continue
+        actual = _resolve_column(df, src_col)
+        if actual is None:
+            continue
+        values = df[actual].astype(str).fillna("")
+        if std_col in _CELLTYPE_COLS:
+            values = values.map(_normalize_celltype_value)
+        df[std_col] = values
     return df
 
 
 def _fill_meta(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure all 15 standard metadata columns exist (empty string default)."""
+    """Ensure all 16 standard metadata columns exist (empty string default)."""
     for col in _STD_META:
         if col not in df.columns:
             df[col] = ""

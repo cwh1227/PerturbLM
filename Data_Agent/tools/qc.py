@@ -30,6 +30,7 @@ Writes intermediate/gene_meta.parquet  (adds/updates is_hvg column)
 from __future__ import annotations
 
 import json
+import re
 import traceback
 from pathlib import Path
 
@@ -38,6 +39,186 @@ import pandas as pd
 from langchain_core.tools import tool
 
 from Agent.state import cell_meta_path, data_source_path, gene_meta_path
+
+# ---------------------------------------------------------------------------
+# Cell-type normalisation helpers
+# ---------------------------------------------------------------------------
+
+# Curated alias table: normalised input key → canonical display name.
+# Keys are already separator-collapsed and lowercased.
+_CELLTYPE_ALIASES: dict[str, str] = {
+    # ── NK / ILC ──
+    "nk":                               "Natural Killer Cell",
+    "nk cell":                          "Natural Killer Cell",
+    "natural killer":                   "Natural Killer Cell",
+    "natural killer cell":              "Natural Killer Cell",
+    "nkt":                              "Natural Killer T Cell",
+    "nkt cell":                         "Natural Killer T Cell",
+    "ilc":                              "Innate Lymphoid Cell",
+    "ilc1":                             "ILC1",
+    "ilc2":                             "ILC2",
+    "ilc3":                             "ILC3",
+    # ── T cells ──
+    "t cell":                           "T Cell",
+    "tcell":                            "T Cell",
+    "cd4":                              "CD4+ T Cell",
+    "cd4 t":                            "CD4+ T Cell",
+    "cd4 t cell":                       "CD4+ T Cell",
+    "cd4+ t":                           "CD4+ T Cell",
+    "cd4+ t cell":                      "CD4+ T Cell",
+    "cd4t":                             "CD4+ T Cell",
+    "cd4+t":                            "CD4+ T Cell",
+    "th":                               "CD4+ T Cell",
+    "helper t":                         "CD4+ T Cell",
+    "helper t cell":                    "CD4+ T Cell",
+    "cd8":                              "CD8+ T Cell",
+    "cd8 t":                            "CD8+ T Cell",
+    "cd8 t cell":                       "CD8+ T Cell",
+    "cd8+ t":                           "CD8+ T Cell",
+    "cd8+ t cell":                      "CD8+ T Cell",
+    "cd8t":                             "CD8+ T Cell",
+    "cd8+t":                            "CD8+ T Cell",
+    "ctl":                              "CD8+ T Cell",
+    "cytotoxic t":                      "CD8+ T Cell",
+    "cytotoxic t cell":                 "CD8+ T Cell",
+    "treg":                             "Regulatory T Cell",
+    "t reg":                            "Regulatory T Cell",
+    "regulatory t":                     "Regulatory T Cell",
+    "regulatory t cell":                "Regulatory T Cell",
+    "gdt":                              "Gamma Delta T Cell",
+    "gamma delta t":                    "Gamma Delta T Cell",
+    "gamma delta t cell":               "Gamma Delta T Cell",
+    "mait":                             "MAIT Cell",
+    "mait cell":                        "MAIT Cell",
+    # ── B cells ──
+    "b cell":                           "B Cell",
+    "bcell":                            "B Cell",
+    "naive b":                          "Naive B Cell",
+    "naive b cell":                     "Naive B Cell",
+    "memory b":                         "Memory B Cell",
+    "memory b cell":                    "Memory B Cell",
+    "plasma":                           "Plasma Cell",
+    "plasma cell":                      "Plasma Cell",
+    "plasmablast":                      "Plasmablast",
+    # ── Dendritic cells ──
+    "dc":                               "Dendritic Cell",
+    "dendritic cell":                   "Dendritic Cell",
+    "pdc":                              "Plasmacytoid Dendritic Cell",
+    "plasmacytoid dc":                  "Plasmacytoid Dendritic Cell",
+    "plasmacytoid dendritic cell":      "Plasmacytoid Dendritic Cell",
+    "mdc":                              "Myeloid Dendritic Cell",
+    "myeloid dc":                       "Myeloid Dendritic Cell",
+    "cdc":                              "Classical Dendritic Cell",
+    "classical dc":                     "Classical Dendritic Cell",
+    "cdc1":                             "Classical Dendritic Cell 1",
+    "cdc2":                             "Classical Dendritic Cell 2",
+    # ── Monocytes / Macrophages ──
+    "mono":                             "Monocyte",
+    "monocyte":                         "Monocyte",
+    "mo":                               "Monocyte",
+    "classical mono":                   "Classical Monocyte",
+    "classical monocyte":               "Classical Monocyte",
+    "nonclassical mono":                "Non-Classical Monocyte",
+    "non classical mono":               "Non-Classical Monocyte",
+    "nonclassical monocyte":            "Non-Classical Monocyte",
+    "nc mono":                          "Non-Classical Monocyte",
+    "mac":                              "Macrophage",
+    "macrophage":                       "Macrophage",
+    "kc":                               "Kupffer Cell",
+    "kupffer":                          "Kupffer Cell",
+    "kupffer cell":                     "Kupffer Cell",
+    # ── Other myeloid ──
+    "neutrophil":                       "Neutrophil",
+    "neu":                              "Neutrophil",
+    "basophil":                         "Basophil",
+    "baso":                             "Basophil",
+    "eosinophil":                       "Eosinophil",
+    "eo":                               "Eosinophil",
+    "mast":                             "Mast Cell",
+    "mast cell":                        "Mast Cell",
+    # ── Erythroid / Megakaryocyte ──
+    "rbc":                              "Erythrocyte",
+    "erythrocyte":                      "Erythrocyte",
+    "ery":                              "Erythrocyte",
+    "erythroblast":                     "Erythroblast",
+    "meg":                              "Megakaryocyte",
+    "megakaryocyte":                    "Megakaryocyte",
+    "platelet":                         "Platelet",
+    # ── Stem / progenitor ──
+    "hsc":                              "Hematopoietic Stem Cell",
+    "hematopoietic stem cell":          "Hematopoietic Stem Cell",
+    "mpp":                              "Multipotent Progenitor",
+    "lmpp":                             "Lymphoid-Primed Multipotent Progenitor",
+    "clp":                              "Common Lymphoid Progenitor",
+    "cmp":                              "Common Myeloid Progenitor",
+    "gmp":                              "Granulocyte-Monocyte Progenitor",
+    # ── Endothelial / stromal ──
+    "ec":                               "Endothelial Cell",
+    "endo":                             "Endothelial Cell",
+    "endothelial":                      "Endothelial Cell",
+    "endothelial cell":                 "Endothelial Cell",
+    "fib":                              "Fibroblast",
+    "fb":                               "Fibroblast",
+    "fibroblast":                       "Fibroblast",
+    "smc":                              "Smooth Muscle Cell",
+    "smooth muscle":                    "Smooth Muscle Cell",
+    "smooth muscle cell":               "Smooth Muscle Cell",
+    "peri":                             "Pericyte",
+    "pericyte":                         "Pericyte",
+    # ── Nervous system ──
+    "neuron":                           "Neuron",
+    "oligo":                            "Oligodendrocyte",
+    "oligodendrocyte":                  "Oligodendrocyte",
+    "opc":                              "Oligodendrocyte Precursor Cell",
+    "astro":                            "Astrocyte",
+    "astrocyte":                        "Astrocyte",
+    "microglia":                        "Microglia",
+    "mg":                               "Microglia",
+    "schwann":                          "Schwann Cell",
+    "schwann cell":                     "Schwann Cell",
+    # ── Epithelial ──
+    "epi":                              "Epithelial Cell",
+    "epithelial":                       "Epithelial Cell",
+    "epithelial cell":                  "Epithelial Cell",
+    "goblet":                           "Goblet Cell",
+    "goblet cell":                      "Goblet Cell",
+    "tuft":                             "Tuft Cell",
+    "tuft cell":                        "Tuft Cell",
+    "enterocyte":                       "Enterocyte",
+    "enteroendocrine":                  "Enteroendocrine Cell",
+    "enteroendocrine cell":             "Enteroendocrine Cell",
+    "ee":                               "Enteroendocrine Cell",
+    # ── Hepatic ──
+    "hep":                              "Hepatocyte",
+    "hepatocyte":                       "Hepatocyte",
+    "cholangiocyte":                    "Cholangiocyte",
+    # ── Adipose ──
+    "adipocyte":                        "Adipocyte",
+    "adipo":                            "Adipocyte",
+}
+
+# Columns whose values are normalised by normalize_celltypes
+_CELLTYPE_VALUE_COLS = ["cellType1", "cellType2", "majorCluster", "subCluster"]
+
+
+def _sep_norm(s: str) -> str:
+    """Collapse hyphens/underscores/extra spaces to single space, strip."""
+    s = re.sub(r"[\-_]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _lookup_celltype(raw: str, extra_aliases: dict[str, str]) -> str:
+    """Return canonical cell-type name for *raw*, or the separator-normalised
+    original if no alias matches.
+
+    Lookup is case-insensitive and separator-normalised.
+    *extra_aliases* (user-supplied) takes priority over the built-in table.
+    """
+    if not raw or raw in ("", "nan", "None"):
+        return raw
+    norm = _sep_norm(raw)
+    key  = norm.lower()
+    return extra_aliases.get(key) or _CELLTYPE_ALIASES.get(key) or norm
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +367,72 @@ def compute_qc_metrics(
 
 
 # ---------------------------------------------------------------------------
-# 2. Cell / sample quality control  (completely format-agnostic)
+# 2. Celltype value normalisation  (format-agnostic, optional pipeline step)
+# ---------------------------------------------------------------------------
+
+@tool
+def normalize_celltypes(
+    extra_aliases:    str = "{}",
+    columns:          str = "",
+    intermediate_dir: str = "",
+) -> str:
+    """
+    Normalise cell-type strings in cell_meta.parquet so the same biological
+    cell type maps to the same canonical label across datasets.
+
+    Two sources of noise are handled:
+      1. Separators / whitespace  — "T-cell", "T_cell", "T  cell" → "T Cell"
+      2. Abbreviations            — "NK", "nk cell" → "Natural Killer Cell"
+                                    "DC" → "Dendritic Cell"
+                                    "Mac" → "Macrophage"  … (100+ built-in entries)
+
+    Normalisation priority: extra_aliases > built-in table > separator-only fix.
+    Non-matched values are returned separator-normalised with original casing.
+
+    extra_aliases — JSON dict of additional alias → canonical name mappings.
+                    Keys are matched case-insensitively after separator collapse.
+                    Example: {"Treg": "Regulatory T Cell", "paneth": "Paneth Cell"}
+
+    columns       — comma-separated list of columns to normalise.
+                    Default: cellType1,cellType2,majorCluster,subCluster
+
+    Reads and overwrites intermediate/cell_meta.parquet.
+    Returns JSON with per-column change counts and sample before/after pairs.
+    """
+    try:
+        df = pd.read_parquet(cell_meta_path(intermediate_dir))
+
+        extra: dict[str, str] = {}
+        if extra_aliases.strip() not in ("", "{}"):
+            raw_extra = json.loads(extra_aliases)
+            # Normalise keys so lookup is consistent
+            extra = {_sep_norm(k).lower(): v for k, v in raw_extra.items()}
+
+        cols = [c.strip() for c in columns.split(",")] if columns.strip() else _CELLTYPE_VALUE_COLS
+        cols = [c for c in cols if c in df.columns]
+
+        report: dict = {}
+        for col in cols:
+            before = df[col].astype(str)
+            after  = before.map(lambda v: _lookup_celltype(v, extra))
+            changed = int((before != after).sum())
+            # Collect up to 5 example mappings for transparency
+            diff_mask = before != after
+            examples = [
+                {"from": b, "to": a}
+                for b, a in zip(before[diff_mask].tolist()[:5], after[diff_mask].tolist()[:5])
+            ]
+            df[col] = after
+            report[col] = {"changed": changed, "examples": examples}
+
+        df.to_parquet(cell_meta_path(intermediate_dir), index=True)
+        return json.dumps({"status": "ok", "n_cells": len(df), "columns": report})
+    except Exception:
+        return json.dumps({"error": traceback.format_exc()})
+
+
+# ---------------------------------------------------------------------------
+# 3. Cell / sample quality control  (completely format-agnostic)
 # ---------------------------------------------------------------------------
 
 @tool
